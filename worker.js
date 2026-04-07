@@ -3,11 +3,20 @@
 // ============================================================================
 const RSS_BASE_URL = "https://rss.nodeseek.com/";
 
+// 备用 RSS 源配置
+const RSS_BACKUP_SOURCES = [
+  "https://rss.nodeseek.com/",                                    // 主源
+  "https://feed.seaya.link/telegram/channel/nodeseekc",          // 备用1: Telegram 转发
+  "https://rsshub.app/telegram/channel/nodeseekc",               // 备用2: RSSHub Telegram
+];
+
 const CATEGORIES = {
   daily: "日常", tech: "技术", info: "情报", review: "测评",
   trade: "交易", carpool: "拼车", dev: "Dev", "photo-share": "贴图",
   expose: "曝光", sandbox: "沙盒",
 };
+
+const RSS_SOURCE_NAMES = ["主源", "备用1(TG)", "备用2(TG)"];
 
 const FETCH_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -55,37 +64,155 @@ async function sendMsg(token, chatId, text) {
 
 // ─── RSS 解析 ────────────────────────────────────────────────────────────────
 
-function parseRSS(xml) {
+// 解析 RSS，支持不同格式的数据源
+function parseRSS(xml, sourceIndex = 0) {
   const entries = [];
   const re = /<item>([\s\S]*?)<\/item>|<entry>([\s\S]*?)<\/entry>/gi;
   let m;
+
   while ((m = re.exec(xml)) !== null) {
     const b = m[1] || m[2];
     const tag = (t) => {
-      const r = b.match(new RegExp(`<${t}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${t}>|<${t}[^>]*>([\\s\\S]*?)<\\/${t}>`));
+      // 使用字符串拼接避免转义问题
+      // 匹配 <tag><![CDATA[...]]></tag> 或 <tag>...</tag>
+      const cdataPattern = '<' + t + '[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/' + t + '>';
+      const normalPattern = '<' + t + '[^>]*>([\\s\\S]*?)<\\/' + t + '>';
+      const r = b.match(new RegExp(cdataPattern + '|' + normalPattern));
       return r ? (r[1] || r[2] || "").trim() : "";
     };
+
     const link = tag("link") || (b.match(/<link[^>]+href="([^"]*)"/) || [])[1] || "";
     const id = tag("id") || tag("guid");
-    const pidM = id.match(/(\d+)/);
-    if (!pidM) continue;
-    const catM = b.match(/<category[^>]*(?:term="([^"]*)")?[^>]*>([^<]*)<\/category>/);
+
+    // 不同数据源提取 post_id 的逻辑不同
+    let postId = null;
+    let category = "";
+    let author = "";
+
+    if (sourceIndex === 0) {
+      // 主源: nodeseek.com RSS
+      const pidM = id.match(/(\d+)/);
+      if (!pidM) continue;
+      postId = parseInt(pidM[1], 10);
+
+      // 使用 tag 函数获取 category，它会正确处理 CDATA
+      category = tag("category");
+      author = tag("author") || tag("dc:creator");
+
+    } else {
+      // 备用源: Telegram 频道 RSS（通过 RSSHub 等）
+      // Telegram 频道的 ID 通常格式不同，尝试多种方式提取
+
+      // 方式1: 从 id 中提取数字
+      let pidM = id.match(/(\d+)/);
+
+      // 方式2: 从 link 中提取 (t.me/channel/123 格式)
+      if (!pidM && link) {
+        pidM = link.match(/t\.me\/[^\/]+\/(\d+)/);
+      }
+
+      // 方式3: 从 guid 或 id 中提取其他格式
+      if (!pidM) {
+        // 尝试使用标题哈希作为 ID（临时方案）
+        const title = tag("title");
+        if (title) {
+          // 简单的哈希：取标题前20字符的 charCode 和
+          let hash = 0;
+          for (let i = 0; i < Math.min(title.length, 20); i++) {
+            hash = ((hash << 5) - hash) + title.charCodeAt(i);
+            hash = hash & hash; // 转为32位整数
+          }
+          postId = Math.abs(hash);
+        }
+      } else {
+        postId = parseInt(pidM[1], 10);
+      }
+
+      if (!postId) continue;
+
+      // Telegram 源通常没有 category，设置为固定值或通过内容分析
+      category = "telegram"; // Telegram 频道内容标记
+      author = tag("author") || "NodeSeek频道";
+    }
+
+    if (!postId) continue;
+
     entries.push({
-      post_id: parseInt(pidM[1], 10),
+      post_id: postId,
       title: tag("title"),
-      link,
-      category: catM ? (catM[1] || catM[2] || "").trim() : "",
-      author: tag("author") || tag("dc:creator"),
+      link: link || `https://t.me/nodeseekc/${postId}`, // 备用链接
+      category: category,
+      author: author,
+      source: sourceIndex, // 记录数据来源
     });
   }
+
   return entries;
 }
 
-async function fetchEntries(category = null) {
-  const url = category ? `${RSS_BASE_URL}?category=${category}` : RSS_BASE_URL;
-  const resp = await fetch(url, { headers: FETCH_HEADERS });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${url}`);
-  return parseRSS(await resp.text());
+// 多源 RSS 获取：主源失败5次后切换到备用源
+async function fetchEntries(category = null, env = {}) {
+  const maxRetriesPerSource = 5;
+  const timeout = 15000; // 15秒超时
+
+  for (let sourceIndex = 0; sourceIndex < RSS_BACKUP_SOURCES.length; sourceIndex++) {
+    const sourceUrl = RSS_BACKUP_SOURCES[sourceIndex];
+    const sourceName = RSS_SOURCE_NAMES[sourceIndex];
+
+    // 构建 URL（只有主源支持 category 参数）
+    let url;
+    if (sourceIndex === 0 && category) {
+      url = `${sourceUrl}?category=${category}`;
+    } else {
+      url = sourceUrl;
+    }
+
+    console.log(`[RSS] 尝试使用 ${sourceName}: ${url}`);
+
+    // 对每个源重试5次
+    for (let attempt = 0; attempt < maxRetriesPerSource; attempt++) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+        const resp = await fetch(url, {
+          headers: FETCH_HEADERS,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`);
+        }
+
+        const text = await resp.text();
+        const entries = parseRSS(text, sourceIndex);
+
+        if (entries.length > 0) {
+          console.log(`[RSS] ${sourceName} 成功获取 ${entries.length} 条数据`);
+          return entries;
+        } else {
+          console.warn(`[RSS] ${sourceName} 返回空数据`);
+        }
+
+      } catch (e) {
+        console.error(`[RSS] ${sourceName} 尝试 ${attempt + 1}/${maxRetriesPerSource} 失败:`, e.message);
+
+        // 如果不是最后一次尝试，等待后重试
+        if (attempt < maxRetriesPerSource - 1) {
+          const delay = 1000 * Math.pow(2, attempt); // 指数退避: 1s, 2s, 4s, 8s
+          console.log(`[RSS] 等待 ${delay}ms 后重试...`);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+
+    console.log(`[RSS] ${sourceName} 所有尝试失败，切换到下一个源`);
+  }
+
+  // 所有源都失败了
+  throw new Error(`所有 RSS 源均不可用（每个源尝试 ${maxRetriesPerSource} 次）`);
 }
 
 // ─── 关键词匹配 ──────────────────────────────────────────────────────────────
@@ -383,14 +510,17 @@ async function handleCommand(env, message) {
     const act = kws.filter((k) => k.enabled).length;
     const pau = kws.length - act;
     const ini = (await getSetting(db, "initialized")) === "true";
+    const failCount = parseInt((await getSetting(db, "rss_fail_count")) || "0", 10);
     const pl = pau ? `  ⏸ 已暂停：${pau} 个\n` : "";
+    const sources = RSS_BACKUP_SOURCES.map((url, i) => `  ${i + 1}. ${i === 0 ? '✓' : '○'} ${url}`).join('\n');
     return sendMsg(token, chatId,
       `✅ <b>Bot 运行正常</b> (Workers)\n\n` +
       `📊 监控关键词：${act} 个\n${pl}` +
       `⏱ 轮询间隔：Cron 每分钟\n` +
       `🚦 防洪上限：10 条/轮\n` +
-      `🌐 RSS：<code>${RSS_BASE_URL}</code>\n` +
-      `🔄 已初始化：${ini ? "是" : "否（首轮后完成）"}`
+      `🔄 已初始化：${ini ? "是" : "否（首轮后完成）"}\n` +
+      `📈 连续失败：${failCount} 次\n\n` +
+      `🌐 RSS 数据源（✓主源）：\n${sources}`
     );
   }
 }
@@ -413,22 +543,29 @@ async function pollRSS(env) {
   const needGlobal = kws.some((k) => !k.category);
   const cats = [...new Set(kws.filter((k) => k.category).map((k) => k.category))];
 
-  // 拉取 RSS
+  // 拉取 RSS（多源备份）
   const entries = new Map();
+  let activeSourceIndex = -1;
   try {
     if (needGlobal) {
-      for (const e of await fetchEntries()) entries.set(e.post_id, e);
+      const results = await fetchEntries(null, env);
+      activeSourceIndex = results[0]?.source ?? 0;
+      for (const e of results) entries.set(e.post_id, e);
     } else {
-      for (const c of cats)
-        for (const e of await fetchEntries(c)) entries.set(e.post_id, e);
+      // 按分类拉取时，只使用主源（备用源不支持分类）
+      for (const c of cats) {
+        const results = await fetchEntries(c, env);
+        for (const e of results) entries.set(e.post_id, e);
+      }
     }
   } catch (e) {
     console.error("RSS fetch failed:", e);
     const fc = parseInt((await getSetting(db, "rss_fail_count")) || "0", 10) + 1;
     await setSetting(db, "rss_fail_count", String(fc));
     if (fc === FAIL_THRESHOLD) {
+      const sourceList = RSS_BACKUP_SOURCES.map((url, i) => `${i + 1}. ${url}`).join('\n');
       await sendMsg(token, uid,
-        `⚠️ <b>RSS 连续失败 ${fc} 次</b>\n数据源：<code>${esc(RSS_BASE_URL)}</code>\n请检查网络或数据源。`
+        `⚠️ <b>RSS 连续失败 ${fc} 次</b>\n所有数据源均不可用：\n<pre>${sourceList}</pre>\n请检查网络或数据源。`
       );
     }
     return;
@@ -451,7 +588,12 @@ async function pollRSS(env) {
     if (await isSeen(db, pid)) continue;
     await markSeen(db, [pid]);
     const matched = kws
-      .filter((k) => (!k.category || k.category === post.category) && matches(post.title, k.keyword, k.match_mode))
+      .filter((k) => {
+        // 备用源（source > 0）的数据忽略 category 限制，只匹配关键词
+        // 主源（source === 0）的数据正常检查 category
+        const categoryMatch = post.source > 0 || !k.category || k.category === post.category;
+        return categoryMatch && matches(post.title, k.keyword, k.match_mode);
+      })
       .map((k) => k.keyword);
     if (matched.length) notifs.push({ post, matched });
   }
