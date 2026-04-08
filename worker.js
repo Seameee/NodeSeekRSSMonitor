@@ -101,34 +101,30 @@ function parseRSS(xml, sourceIndex = 0) {
 
     } else {
       // 备用源: Telegram 频道 RSS（通过 RSSHub 等）
-      // Telegram 频道的 ID 通常格式不同，尝试多种方式提取
+      // 从 description 中提取 NodeSeek 链接（只取第一个）
+      const description = tag("description");
+      const nsLinkRegex = /https:\/\/www\.nodeseek\.com\/post-\d+-\d+/;
+      const nsLinkM = nsLinkRegex.exec(description);
+      const nsLink = nsLinkM ? nsLinkM[0] : null;
 
-      // 方式1: 从 id 中提取数字
-      let pidM = id.match(/(\d+)/);
+      // 从 NodeSeek 链接或原始 link 中提取 post_id
+      let pidM = null;
+      if (nsLink) {
+        pidM = nsLink.match(/post-(\d+)-/);
+      }
 
-      // 方式2: 从 link 中提取 (t.me/channel/123 格式)
+      // 备用方案：从 link 中提取 (t.me/channel/123 格式)
       if (!pidM && link) {
         pidM = link.match(/t\.me\/[^\/]+\/(\d+)/);
       }
 
-      // 方式3: 从 guid 或 id 中提取其他格式
-      if (!pidM) {
-        // 尝试使用标题哈希作为 ID（临时方案）
-        const title = tag("title");
-        if (title) {
-          // 简单的哈希：取标题前20字符的 charCode 和
-          let hash = 0;
-          for (let i = 0; i < Math.min(title.length, 20); i++) {
-            hash = ((hash << 5) - hash) + title.charCodeAt(i);
-            hash = hash & hash; // 转为32位整数
-          }
-          postId = Math.abs(hash);
-        }
-      } else {
-        postId = parseInt(pidM[1], 10);
-      }
+      if (!pidM) continue;
+      postId = parseInt(pidM[1], 10);
 
-      if (!postId) continue;
+      // 更新 link 为 NodeSeek 链接
+      if (nsLink) {
+        link = nsLink;
+      }
 
       // Telegram 源通常没有 category，设置为固定值或通过内容分析
       category = "telegram"; // Telegram 频道内容标记
