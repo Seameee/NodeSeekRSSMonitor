@@ -651,6 +651,10 @@ async function handleCommand(env, message) {
     const ini = (await getSetting(db, "initialized")) === "true";
     const failCount = parseInt((await getSetting(db, "rss_fail_count")) || "0", 10);
     const dev = await getDevState(db);
+    const ai = aiConfig(env);
+    const al = ai
+      ? `🤖 AI 摘要：<b>开启</b>（模型 <code>${esc(ai.model)}</code>${ai.minLen > 0 ? `，正文 ≥ ${ai.minLen} 字` : ""}）\n`
+      : `🤖 AI 摘要：关闭（未配置 AI_API_KEY / AI_MODEL）\n`;
     const pl = pau ? `  ⏸ 已暂停：${pau} 个\n` : "";
     const dl = dev
       ? `🧪 Dev 模式：<b>开启</b>（${dev.left < 0 ? "无限" : `剩余 ${dev.left} 条`}，关键词过滤已暂停）\n`
@@ -660,6 +664,7 @@ async function handleCommand(env, message) {
       `✅ <b>Bot 运行正常</b> (Workers)\n\n` +
       `📊 监控关键词：${act} 个\n${pl}` +
       dl +
+      al +
       `⏱ 轮询间隔：Cron 每分钟\n` +
       `🚦 防洪上限：10 条/轮\n` +
       `🔄 已初始化：${ini ? "是" : "否（首轮后完成）"}\n` +
@@ -812,6 +817,10 @@ async function pollRSS(env) {
           if (s) summaries.set(post.post_id, s);
         })
       );
+      console.log(`[AI] 摘要成功 ${summaries.size}/${targets.length} 条`);
+    } else {
+      const why = ai.minLen > 0 ? `空正文或短于 ${ai.minLen} 字` : "正文为空";
+      console.log(`[AI] 本轮 ${toSend.length} 条通知均无可用正文（${why}），跳过摘要`);
     }
   }
 
