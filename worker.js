@@ -602,10 +602,15 @@ async function pollRSS(env) {
   const overflow = notifs.slice(MAX_NOTIF);
 
   for (const { post, matched } of toSend) {
-    const kt = matched.map((k) => `<code>${esc(k)}</code>`).join(" ");
+    // 命中关键词放进可折叠引用块（<blockquote expandable>）：
+    // 正则很长时默认折叠，点箭头才展开，不再把整条消息撑满。
+    // blockquote 内可以嵌套 <code>（TDLib 校验里 pre/code 只允许嵌在 blockquote 内），
+    // 所以等宽字体保留。
+    const kt = matched.map((k) => `<code>${esc(k)}</code>`).join("\n");
     const cn = CATEGORIES[post.category] || post.category;
     const msg =
-      `🔔 <b>关键词提醒</b>  ${kt}\n\n` +
+      `🔔 <b>关键词提醒</b>\n` +
+      `<blockquote expandable>${kt}</blockquote>\n\n` +
       `📌 <b>${esc(post.title)}</b>\n` +
       `🏷 ${esc(cn)}\n👤 ${esc(post.author)}\n🔗 ${post.link}`;
     const ok = await sendMsg(token, uid, msg);
