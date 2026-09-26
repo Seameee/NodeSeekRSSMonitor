@@ -62,6 +62,94 @@ async function sendMsg(token, chatId, text) {
   return false;
 }
 
+// ─── AI 摘要（OpenAI 兼容接口，可选）─────────────────────────────────────────
+// 只要不配置 AI_API_KEY + AI_MODEL，本段完全不会执行，行为与以前一致。
+// 兼容任何 OpenAI 协议端点：DeepSeek 官方 / 中转站 / OpenAI / Groq / 硅基流动 …
+
+const AI_DEFAULT_PROMPT =
+  "你是 VPS 与主机圈论坛（NodeSeek）的帖子摘要助手。用中文输出 1~2 句话、不超过 80 字，" +
+  "只讲重点：谁在出/收什么、价格与配置、关键条件（到期时间、push 还是邮箱转移、地区与线路、是否溢价）。" +
+  "不要复述标题，不要客套话，不要 Markdown 标记，不要输出“总结：”之类的前缀。";
+
+// 读取 AI 配置；未配置返回 null
+function aiConfig(env) {
+  const key = env.AI_API_KEY;
+  const model = env.AI_MODEL;
+  if (!key || !model) return null;
+  return {
+    base: String(env.AI_BASE_URL || "https://api.deepseek.com/v1").replace(/\/+$/, ""),
+    key: key,
+    model: model,
+    minLen: parseInt(env.AI_MIN_LEN || "0", 10),
+    maxPerRound: parseInt(env.AI_MAX_PER_ROUND || "5", 10),
+    maxTokens: parseInt(env.AI_MAX_TOKENS || "4000", 10),
+    timeout: parseInt(env.AI_TIMEOUT_MS || "15000", 10),
+    prompt: env.AI_PROMPT || AI_DEFAULT_PROMPT,
+  };
+}
+
+// 去掉 HTML 标签、压缩空白，并限制送入模型的正文长度
+function plainText(html, limit = 2000) {
+  return String(html || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+}
+
+// 调用模型生成摘要；任何失败都返回空串（绝不影响通知发送）
+async function aiSummary(cfg, title, body, category) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.timeout);
+  try {
+    const resp = await fetch(`${cfg.base}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.key}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          { role: "system", content: cfg.prompt },
+          { role: "user", content: `标题：${title}\n版块：${category}\n正文：\n${body}` },
+        ],
+        temperature: 0.3,
+        max_tokens: cfg.maxTokens,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      console.error(`[AI] HTTP ${resp.status}: ${t.slice(0, 200)}`);
+      return "";
+    }
+
+    const data = await resp.json();
+    const out = data?.choices?.[0]?.message?.content;
+    if (typeof out !== "string" || !out.trim()) {
+      // 推理型模型可能把预算耗在思考上导致 content 为空，此时宁可不显示摘要
+      console.error("[AI] 返回内容为空");
+      return "";
+    }
+    return out.replace(/\s+/g, " ").trim().slice(0, 400);
+  } catch (e) {
+    console.error("[AI] 摘要失败:", e.message);
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── RSS 解析 ────────────────────────────────────────────────────────────────
 
 // 解析 RSS，支持不同格式的数据源
@@ -83,6 +171,8 @@ function parseRSS(xml, sourceIndex = 0) {
 
     const link = tag("link") || (b.match(/<link[^>]+href="([^"]*)"/) || [])[1] || "";
     const id = tag("id") || tag("guid");
+    // 正文：主源是帖子正文纯文本，备用源是 TG 频道的转发文案
+    const description = tag("description");
 
     // 不同数据源提取 post_id 的逻辑不同
     let postId = null;
@@ -102,7 +192,6 @@ function parseRSS(xml, sourceIndex = 0) {
     } else {
       // 备用源: Telegram 频道 RSS（通过 RSSHub 等）
       // 从 description 中提取 NodeSeek 链接（只取第一个）
-      const description = tag("description");
       const nsLinkRegex = /https:\/\/www\.nodeseek\.com\/post-\d+-\d+/;
       const nsLinkM = nsLinkRegex.exec(description);
       const nsLink = nsLinkM ? nsLinkM[0] : null;
@@ -140,6 +229,7 @@ function parseRSS(xml, sourceIndex = 0) {
       category: category,
       author: author,
       source: sourceIndex, // 记录数据来源
+      content: description, // 帖子正文（供 AI 摘要使用）
     });
   }
 
@@ -521,6 +611,24 @@ async function handleCommand(env, message) {
   }
 }
 
+// ─── 通知消息组装 ────────────────────────────────────────────────────────────
+
+function buildNotifMsg(post, matched, summary) {
+  // 命中关键词放进可折叠引用块（<blockquote expandable>）：
+  // 正则很长时默认折叠，点箭头才展开，不再把整条消息撑满。
+  // blockquote 内可以嵌套 <code>（TDLib 校验里 pre/code 只允许嵌在 blockquote 内），
+  // 所以等宽字体保留。
+  const kt = matched.map((k) => `<code>${esc(k)}</code>`).join("\n");
+  const cn = CATEGORIES[post.category] || post.category;
+  return (
+    `🔔 <b>关键词提醒</b>\n` +
+    `<blockquote expandable>${kt}</blockquote>\n\n` +
+    `📌 <b>${esc(post.title)}</b>\n` +
+    (summary ? `📝 <blockquote>${esc(summary)}</blockquote>\n` : "") +
+    `🏷 ${esc(cn)}\n👤 ${esc(post.author)}\n🔗 ${post.link}`
+  );
+}
+
 // ─── RSS 轮询（Cron Trigger 调用）────────────────────────────────────────────
 
 async function pollRSS(env) {
@@ -601,18 +709,30 @@ async function pollRSS(env) {
   const toSend = notifs.slice(0, MAX_NOTIF);
   const overflow = notifs.slice(MAX_NOTIF);
 
+  // AI 摘要：并发预取，只处理正文够长的帖子，且每轮有数量上限。
+  // 未配置 AI_API_KEY/AI_MODEL 时 ai 为 null，整段跳过。
+  const ai = aiConfig(env);
+  const summaries = new Map();
+  if (ai) {
+    const targets = toSend
+      .map(({ post }) => ({ post, body: plainText(post.content) }))
+      // 正文为空的帖子（多为纯图片帖或已删帖）没有可总结的内容，直接跳过
+      .filter(({ body }) => body.length > 0 && body.length >= ai.minLen)
+      .slice(0, ai.maxPerRound);
+    if (targets.length) {
+      console.log(`[AI] 本轮生成 ${targets.length} 条摘要（模型 ${ai.model}）`);
+      await Promise.all(
+        targets.map(async ({ post, body }) => {
+          const cn = CATEGORIES[post.category] || post.category;
+          const s = await aiSummary(ai, post.title, body, cn);
+          if (s) summaries.set(post.post_id, s);
+        })
+      );
+    }
+  }
+
   for (const { post, matched } of toSend) {
-    // 命中关键词放进可折叠引用块（<blockquote expandable>）：
-    // 正则很长时默认折叠，点箭头才展开，不再把整条消息撑满。
-    // blockquote 内可以嵌套 <code>（TDLib 校验里 pre/code 只允许嵌在 blockquote 内），
-    // 所以等宽字体保留。
-    const kt = matched.map((k) => `<code>${esc(k)}</code>`).join("\n");
-    const cn = CATEGORIES[post.category] || post.category;
-    const msg =
-      `🔔 <b>关键词提醒</b>\n` +
-      `<blockquote expandable>${kt}</blockquote>\n\n` +
-      `📌 <b>${esc(post.title)}</b>\n` +
-      `🏷 ${esc(cn)}\n👤 ${esc(post.author)}\n🔗 ${post.link}`;
+    const msg = buildNotifMsg(post, matched, summaries.get(post.post_id));
     const ok = await sendMsg(token, uid, msg);
     for (const k of matched) await logNotif(db, post, k, ok ? "sent" : "failed");
   }
