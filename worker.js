@@ -67,8 +67,8 @@ async function sendMsg(token, chatId, text) {
 // 兼容任何 OpenAI 协议端点：DeepSeek 官方 / 中转站 / OpenAI / Groq / 硅基流动 …
 
 const AI_DEFAULT_PROMPT =
-  "你是 VPS 与主机圈论坛（NodeSeek）的帖子摘要助手。用中文输出 1~2 句话、不超过 80 字，" +
-  "只讲重点：谁在出/收什么、价格与配置、关键条件（到期时间、push 还是邮箱转移、地区与线路、是否溢价）。" +
+  "你是 NodeSeek 论坛的帖子摘要助手。用中文输出 1~2 句话、不超过 80 字，" +
+  "概括这个帖子在讲什么、有哪些关键信息，让读者不点开也能知道内容要点。" +
   "不要复述标题，不要客套话，不要 Markdown 标记，不要输出“总结：”之类的前缀。";
 
 // 读取 AI 配置；未配置返回 null
