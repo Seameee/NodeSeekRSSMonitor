@@ -80,6 +80,11 @@ function aiConfig(env) {
     base: String(env.AI_BASE_URL || "https://api.deepseek.com/v1").replace(/\/+$/, ""),
     key: key,
     model: model,
+    // 备用模型可写多个，用逗号分隔，按顺序依次尝试
+    fallbackModels: String(env.AI_MODEL_FALLBACK || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
     minLen: parseInt(env.AI_MIN_LEN || "0", 10),
     maxPerRound: parseInt(env.AI_MAX_PER_ROUND || "5", 10),
     maxTokens: parseInt(env.AI_MAX_TOKENS || "4000", 10),
@@ -104,8 +109,8 @@ function plainText(html, limit = 2000) {
     .slice(0, limit);
 }
 
-// 调用模型生成摘要；任何失败都返回空串（绝不影响通知发送）
-async function aiSummary(cfg, title, body, category) {
+// 单次调用某个模型；任何失败都返回空串（绝不影响通知发送）
+async function aiCall(cfg, model, title, body, category) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeout);
   try {
@@ -116,7 +121,7 @@ async function aiSummary(cfg, title, body, category) {
         Authorization: `Bearer ${cfg.key}`,
       },
       body: JSON.stringify({
-        model: cfg.model,
+        model: model,
         messages: [
           { role: "system", content: cfg.prompt },
           { role: "user", content: `标题：${title}\n版块：${category}\n正文：\n${body}` },
@@ -130,7 +135,7 @@ async function aiSummary(cfg, title, body, category) {
 
     if (!resp.ok) {
       const t = await resp.text().catch(() => "");
-      console.error(`[AI] HTTP ${resp.status}: ${t.slice(0, 200)}`);
+      console.error(`[AI] ${model} HTTP ${resp.status}: ${t.slice(0, 200)}`);
       return "";
     }
 
@@ -138,16 +143,30 @@ async function aiSummary(cfg, title, body, category) {
     const out = data?.choices?.[0]?.message?.content;
     if (typeof out !== "string" || !out.trim()) {
       // 推理型模型可能把预算耗在思考上导致 content 为空，此时宁可不显示摘要
-      console.error("[AI] 返回内容为空");
+      console.error(`[AI] ${model} 返回内容为空`);
       return "";
     }
     return out.replace(/\s+/g, " ").trim().slice(0, 400);
   } catch (e) {
-    console.error("[AI] 摘要失败:", e.message);
+    console.error(`[AI] ${model} 调用失败:`, e.message);
     return "";
   } finally {
     clearTimeout(timer);
   }
+}
+
+// 依次尝试主模型、备用模型…第一个成功的结果即返回。
+// 失败包括：网络异常 / 超时 / HTTP 非 2xx / 返回空内容。
+async function aiSummary(cfg, title, body, category) {
+  const chain = [...new Set([cfg.model, ...(cfg.fallbackModels || [])].filter(Boolean))];
+  for (let i = 0; i < chain.length; i++) {
+    const out = await aiCall(cfg, chain[i], title, body, category);
+    if (out) return out;
+    if (i < chain.length - 1) {
+      console.warn(`[AI] 模型 ${chain[i]} 失败，回退到 ${chain[i + 1]}`);
+    }
+  }
+  return "";
 }
 
 // ─── RSS 解析 ────────────────────────────────────────────────────────────────
@@ -653,7 +672,9 @@ async function handleCommand(env, message) {
     const dev = await getDevState(db);
     const ai = aiConfig(env);
     const al = ai
-      ? `🤖 AI 摘要：<b>开启</b>（模型 <code>${esc(ai.model)}</code>${ai.minLen > 0 ? `，正文 ≥ ${ai.minLen} 字` : ""}）\n`
+      ? `🤖 AI 摘要：<b>开启</b>（模型 <code>${esc(ai.model)}</code>` +
+        ai.fallbackModels.map((m) => ` → <code>${esc(m)}</code>`).join("") +
+        `${ai.minLen > 0 ? `，正文 ≥ ${ai.minLen} 字` : ""}）\n`
       : `🤖 AI 摘要：关闭（未配置 AI_API_KEY / AI_MODEL）\n`;
     const pl = pau ? `  ⏸ 已暂停：${pau} 个\n` : "";
     const dl = dev
@@ -809,7 +830,8 @@ async function pollRSS(env) {
       .filter(({ body }) => body.length > 0 && body.length >= ai.minLen)
       .slice(0, ai.maxPerRound);
     if (targets.length) {
-      console.log(`[AI] 本轮生成 ${targets.length} 条摘要（模型 ${ai.model}）`);
+      const chain = [ai.model, ...ai.fallbackModels].filter(Boolean).join(" → ");
+      console.log(`[AI] 本轮生成 ${targets.length} 条摘要（模型 ${chain}）`);
       await Promise.all(
         targets.map(async ({ post, body }) => {
           const cn = CATEGORIES[post.category] || post.category;
