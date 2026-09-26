@@ -708,18 +708,17 @@ function buildRichNotifMsg(post, matched, summary, dev) {
   // 1) 标题本身是链接 —— 点击区域最大，不再需要单独的「原帖」链接
   parts.push(`<h3><a href="${link}">${esc(post.title)}</a></h3>`);
 
-  // 2) 版块 · 作者：夹在标题与摘要之间，上下各留一个空行做区隔
+  // 2) 版块 · 作者：紧跟标题下方（与标题之间留一个空行，与摘要之间不留）
   const meta = [];
   if (dev) {
     meta.push(dev.remaining < 0 ? "🧪 Dev 模式" : dev.remaining > 0 ? `🧪 Dev 模式 · 剩余 ${dev.remaining} 条` : "🧪 Dev 模式 · 最后一条");
   }
   meta.push(esc(cn), esc(post.author));
   parts.push(`<p>&nbsp;</p>`);
-  parts.push(`<p><i>${meta.join(" · ")}</i></p>`);
+  parts.push(`<p>${meta.join(" · ")}</p>`);
 
   // 3) 摘要：引用块承载，并用 cite 标明是 AI 生成
   if (summary) {
-    parts.push(`<p>&nbsp;</p>`);
     parts.push(`<blockquote>${esc(summary)}<cite>AI 摘要</cite></blockquote>`);
   }
 
