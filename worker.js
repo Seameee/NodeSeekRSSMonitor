@@ -697,6 +697,51 @@ async function handleCommand(env, message) {
 
 // ─── 通知消息组装 ────────────────────────────────────────────────────────────
 
+// 富文本版通知（Bot API 10.3 的 sendRichMessage）。
+// 视觉层级：标题(h3) → 摘要(p) → 元信息(footer) → 命中关键词(details 折叠，放最底部)
+function buildRichNotifMsg(post, matched, summary, dev) {
+  const cn = CATEGORIES[post.category] || post.category;
+  const kwText = (matched || []).join("\n");
+  const parts = [];
+
+  // 1) 标题：整条通知的视觉锚点
+  parts.push(`<h3>${esc(post.title)}</h3>`);
+
+  // 2) 摘要：独立成段，比引用块轻，不跟标题抢视线
+  if (summary) parts.push(`<p>${esc(summary)}</p>`);
+
+  // 3) 元信息：压成一行小字
+  const meta = [];
+  if (dev) {
+    meta.push(dev.remaining < 0 ? "🧪 Dev 模式" : dev.remaining > 0 ? `🧪 Dev 模式 · 剩余 ${dev.remaining} 条` : "🧪 Dev 模式 · 最后一条");
+  }
+  meta.push(esc(cn), esc(post.author), `<a href="${esc(post.link)}">打开原帖</a>`);
+  parts.push(`<footer>${meta.join(" · ")}</footer>`);
+
+  // 4) 命中关键词：短的内联展开，长的默认折叠（避免长正则刷屏）
+  if (kwText) {
+    const open = kwText.length <= 60 ? " open" : "";
+    parts.push(`<details${open}><summary>命中关键词</summary><pre>${esc(kwText)}</pre></details>`);
+  }
+  return parts.join("");
+}
+
+// 发送富文本消息。任何失败都返回 false，由调用方降级为普通 sendMessage。
+async function sendRichMsg(token, chatId, html) {
+  try {
+    const r = await tg(token, "sendRichMessage", {
+      chat_id: chatId,
+      rich_message: { html },
+    });
+    if (r.ok) return true;
+    console.error(`[TG] sendRichMessage 失败: ${r.description}`);
+  } catch (e) {
+    console.error("[TG] sendRichMessage 异常:", e.message);
+  }
+  return false;
+}
+
+// 经典 HTML 版通知：富文本不可用（旧版 Bot API / 老客户端）时的降级方案
 function buildNotifMsg(post, matched, summary, dev) {
   // dev 为 null/undefined 时是普通关键词通知；
   // 否则是 Dev 模式通知，dev.remaining：<0 无限、>0 还剩几条、0 本条是最后一条
@@ -851,8 +896,11 @@ async function pollRSS(env) {
     // Dev 模式：把“这是第几条 / 还剩几条”显示在消息头部
     const devInfo = dev ? { remaining: dev.left < 0 ? -1 : Math.max(0, dev.left - (sentCount + 1)) } : null;
     sentCount++;
-    const msg = buildNotifMsg(post, matched, summaries.get(post.post_id), devInfo);
-    const ok = await sendMsg(token, uid, msg);
+    const sm = summaries.get(post.post_id);
+    // 优先发富文本，失败则降级为经典 HTML（老客户端/旧 Bot API 也能正常收到）
+    const ok =
+      (await sendRichMsg(token, uid, buildRichNotifMsg(post, matched, sm, devInfo))) ||
+      (await sendMsg(token, uid, buildNotifMsg(post, matched, sm, devInfo)));
     // Dev 模式没有关键词，用 (dev) 占位，保证 /history 里能看到
     for (const k of (matched.length ? matched : ["(dev)"])) {
       await logNotif(db, post, k, ok ? "sent" : "failed");
