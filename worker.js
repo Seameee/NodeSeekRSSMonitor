@@ -347,6 +347,22 @@ async function setSetting(db, k, v) {
   await db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?1,?2)").bind(k, v).run();
 }
 
+// ─── Dev 模式状态 ────────────────────────────────────────────────────────────
+// settings.dev_left：不存在/空串 = 关闭；-1 = 无限；N>0 = 还剩 N 条可推送
+const DEV_KEY = "dev_left";
+
+async function getDevState(db) {
+  const v = await getSetting(db, DEV_KEY);
+  if (v === null || v === "") return null;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n === 0) return null;
+  return { left: n < 0 ? -1 : n };
+}
+
+async function setDevState(db, left) {
+  await setSetting(db, DEV_KEY, left === null ? "" : String(left));
+}
+
 async function listKeywords(db) {
   return (await db.prepare("SELECT keyword,category,match_mode,enabled FROM keywords ORDER BY created_at").all()).results;
 }
@@ -450,6 +466,7 @@ async function handleCommand(env, message) {
       "/resume <code>&lt;序号或关键词&gt;</code>  — 恢复\n" +
       "/list  — 列表\n" +
       "/history <i>[数量]</i>  — 推送记录（默认 10）\n" +
+      "/dev <i>[条数|exit]</i>  — Dev 模式：暂停关键词，任何新帖都推送\n" +
       "/status  — 运行状态\n\n" +
       "🏷 <b>可用版块：</b>\n" +
       "<code>daily</code> 日常 · <code>tech</code> 技术 · <code>info</code> 情报 · <code>review</code> 测评 · <code>trade</code> 交易\n" +
@@ -591,17 +608,58 @@ async function handleCommand(env, message) {
     return sendMsg(token, chatId, ls.join("\n"));
   }
 
+  if (cmd === "/dev") {
+    const a = (args[0] || "").toLowerCase();
+    const usage =
+      "🧪 <b>Dev 模式</b>：暂停关键词过滤，任何新帖都推送。\n\n" +
+      "/dev  — 进入（无限，直到 /dev exit）\n" +
+      "/dev <code>&lt;条数&gt;</code>  — 推送指定条数后自动退出\n" +
+      "/dev exit  — 立即退出";
+
+    if (!a) {
+      await setDevState(db, -1);
+      return sendMsg(token, chatId,
+        "🧪 <b>已进入 Dev 模式（无限）</b>\n\n" +
+        "关键词监控已暂停，<b>任何新帖都会推送</b>。\n" +
+        "退出：/dev exit\n\n" +
+        "⚠️ <i>忘记退出会一直推送。只想试几条的话用 <code>/dev 5</code> 这种带数量的写法。</i>"
+      );
+    }
+
+    if (a === "exit" || a === "off" || a === "stop" || a === "0") {
+      await setDevState(db, null);
+      return sendMsg(token, chatId, "✅ <b>已退出 Dev 模式</b>，恢复关键词监控。");
+    }
+
+    const n = parseInt(a, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      return sendMsg(token, chatId, usage);
+    }
+
+    await setDevState(db, n);
+    return sendMsg(token, chatId,
+      `🧪 <b>已进入 Dev 模式</b>（推送 ${n} 条后自动退出）\n\n` +
+      "关键词监控已暂停，任何新帖都会推送。\n" +
+      "提前退出：/dev exit"
+    );
+  }
+
   if (cmd === "/status") {
     const kws = await listKeywords(db);
     const act = kws.filter((k) => k.enabled).length;
     const pau = kws.length - act;
     const ini = (await getSetting(db, "initialized")) === "true";
     const failCount = parseInt((await getSetting(db, "rss_fail_count")) || "0", 10);
+    const dev = await getDevState(db);
     const pl = pau ? `  ⏸ 已暂停：${pau} 个\n` : "";
+    const dl = dev
+      ? `🧪 Dev 模式：<b>开启</b>（${dev.left < 0 ? "无限" : `剩余 ${dev.left} 条`}，关键词过滤已暂停）\n`
+      : `🧪 Dev 模式：关闭\n`;
     const sources = RSS_BACKUP_SOURCES.map((url, i) => `  ${i + 1}. ${i === 0 ? '✓' : '○'} ${url}`).join('\n');
     return sendMsg(token, chatId,
       `✅ <b>Bot 运行正常</b> (Workers)\n\n` +
       `📊 监控关键词：${act} 个\n${pl}` +
+      dl +
       `⏱ 轮询间隔：Cron 每分钟\n` +
       `🚦 防洪上限：10 条/轮\n` +
       `🔄 已初始化：${ini ? "是" : "否（首轮后完成）"}\n` +
@@ -613,16 +671,28 @@ async function handleCommand(env, message) {
 
 // ─── 通知消息组装 ────────────────────────────────────────────────────────────
 
-function buildNotifMsg(post, matched, summary) {
-  // 命中关键词放进可折叠引用块（<blockquote expandable>）：
-  // 正则很长时默认折叠，点箭头才展开，不再把整条消息撑满。
-  // blockquote 内可以嵌套 <code>（TDLib 校验里 pre/code 只允许嵌在 blockquote 内），
-  // 所以等宽字体保留。
-  const kt = matched.map((k) => `<code>${esc(k)}</code>`).join("\n");
+function buildNotifMsg(post, matched, summary, dev) {
+  // dev 为 null/undefined 时是普通关键词通知；
+  // 否则是 Dev 模式通知，dev.remaining：<0 无限、>0 还剩几条、0 本条是最后一条
   const cn = CATEGORIES[post.category] || post.category;
+
+  let head;
+  if (dev) {
+    const tail = dev.remaining < 0 ? "" : dev.remaining > 0 ? `（剩余 ${dev.remaining} 条）` : "（最后一条）";
+    head = `🧪 <b>Dev 模式</b>${tail}\n\n`;
+  } else {
+    // 命中关键词放进可折叠引用块（<blockquote expandable>）：
+    // 正则很长时默认折叠，点箭头才展开，不再把整条消息撑满。
+    // blockquote 内可以嵌套 <code>（TDLib 校验里 pre/code 只允许嵌在 blockquote 内），
+    // 所以等宽字体保留。
+    const kt = matched.map((k) => `<code>${esc(k)}</code>`).join("\n");
+    head =
+      `🔔 <b>关键词提醒</b>\n` +
+      `<blockquote expandable>${kt}</blockquote>\n\n`;
+  }
+
   return (
-    `🔔 <b>关键词提醒</b>\n` +
-    `<blockquote expandable>${kt}</blockquote>\n\n` +
+    head +
     `📌 <b>${esc(post.title)}</b>\n` +
     (summary ? `📝 <blockquote>${esc(summary)}</blockquote>\n` : "") +
     `🏷 ${esc(cn)}\n👤 ${esc(post.author)}\n🔗 ${post.link}`
@@ -640,11 +710,15 @@ async function pollRSS(env) {
 
   await initDB(db);
 
+  // Dev 模式：暂停关键词过滤，任何新帖都推送（受条数与防洪上限约束）
+  const dev = await getDevState(db);
+  const devBudget = dev ? (dev.left < 0 ? MAX_NOTIF : Math.min(dev.left, MAX_NOTIF)) : 0;
+
   const allKw = await listKeywords(db);
   const kws = allKw.filter((k) => k.enabled);
-  if (!kws.length) return;
+  if (!dev && !kws.length) return;
 
-  const needGlobal = kws.some((k) => !k.category);
+  const needGlobal = dev ? true : kws.some((k) => !k.category);
   const cats = [...new Set(kws.filter((k) => k.category).map((k) => k.category))];
 
   // 拉取 RSS（多源备份）
@@ -689,8 +763,18 @@ async function pollRSS(env) {
   // 匹配
   const notifs = [];
   for (const [pid, post] of [...entries.entries()].sort((a, b) => a[0] - b[0])) {
+    // Dev 模式配额用满就停止消费：本轮剩余的帖子不标记已见，
+    // 退出 Dev 模式后它们仍会被关键词正常评估，不会丢失。
+    if (dev && notifs.length >= devBudget) break;
     if (await isSeen(db, pid)) continue;
     await markSeen(db, [pid]);
+
+    if (dev) {
+      // Dev 模式：不做关键词匹配，全部推送
+      notifs.push({ post, matched: [] });
+      continue;
+    }
+
     const matched = kws
       .filter((k) => {
         // 备用源（source > 0）的数据忽略 category 限制，只匹配关键词
@@ -731,10 +815,17 @@ async function pollRSS(env) {
     }
   }
 
+  let sentCount = 0;
   for (const { post, matched } of toSend) {
-    const msg = buildNotifMsg(post, matched, summaries.get(post.post_id));
+    // Dev 模式：把“这是第几条 / 还剩几条”显示在消息头部
+    const devInfo = dev ? { remaining: dev.left < 0 ? -1 : Math.max(0, dev.left - (sentCount + 1)) } : null;
+    sentCount++;
+    const msg = buildNotifMsg(post, matched, summaries.get(post.post_id), devInfo);
     const ok = await sendMsg(token, uid, msg);
-    for (const k of matched) await logNotif(db, post, k, ok ? "sent" : "failed");
+    // Dev 模式没有关键词，用 (dev) 占位，保证 /history 里能看到
+    for (const k of (matched.length ? matched : ["(dev)"])) {
+      await logNotif(db, post, k, ok ? "sent" : "failed");
+    }
   }
 
   if (overflow.length) {
@@ -747,6 +838,17 @@ async function pollRSS(env) {
       for (const k of matched) await logNotif(db, post, k, "sent");
     }
     await sendMsg(token, uid, lines.join("\n"));
+  }
+
+  // Dev 模式：扣减配额，用完自动退出并恢复关键词监控
+  if (dev && dev.left > 0) {
+    const left = Math.max(0, dev.left - toSend.length);
+    if (left > 0) {
+      await setSetting(db, DEV_KEY, String(left));
+    } else {
+      await setSetting(db, DEV_KEY, "");
+      await sendMsg(token, uid, "🧪 <b>Dev 模式已结束</b>：设定的推送数量已用完，已恢复关键词监控。");
+    }
   }
 
   await cleanup(db);
