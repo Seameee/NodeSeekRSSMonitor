@@ -111,11 +111,10 @@ Settings → Variables and Secrets 里按需添加：
 
 | 位置 | 元素 | 作用 |
 | ---- | ---- | ---- |
-| 1 | `<h3><a href="帖子链接">标题</a></h3>` | 标题即链接，**整块可点**，点击区域最大 |
-| 2 | `<p>&nbsp;</p>` | 显式空行，把标题和摘要分开 |
+| 1 | `<h3><a href="帖子链接">标题</a></h3>` | 标题即链接，**整块可点**，无需单独的「原帖」链接 |
+| 2 | `<p>&nbsp;</p>` + `<p><i>版块 · 作者</i></p>` + `<p>&nbsp;</p>` | 版块与作者夹在标题和摘要之间，上下各一个空行 |
 | 3 | `<blockquote>摘要<cite>AI 摘要</cite></blockquote>` | 摘要用引用块区分，`cite` 标明是 AI 生成 |
-| 4 | `<hr/>` + `<footer>版块 · 作者 · 原帖</footer>` | 分隔线 + 元信息一行小字 |
-| 5 | `<details><summary>命中关键词</summary><pre>…</pre></details>` | 长正则默认折叠，放最底部 |
+| 4 | `<details><summary>命中关键词</summary><pre>…</pre></details>` | 长正则默认折叠，放最底部 |
 
 要点：
 
