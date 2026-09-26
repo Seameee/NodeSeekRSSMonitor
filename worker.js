@@ -698,24 +698,29 @@ async function handleCommand(env, message) {
 // ─── 通知消息组装 ────────────────────────────────────────────────────────────
 
 // 富文本版通知（Bot API 10.3 的 sendRichMessage）。
-// 视觉层级：标题(h3) → 摘要(p) → 元信息(footer) → 命中关键词(details 折叠，放最底部)
+// 视觉层级：标题(h3，整块可点) → 空行 → 摘要(引用块+署名) → 分隔线 → 元信息 → 折叠关键词
 function buildRichNotifMsg(post, matched, summary, dev) {
   const cn = CATEGORIES[post.category] || post.category;
   const kwText = (matched || []).join("\n");
+  const link = esc(post.link);
   const parts = [];
 
-  // 1) 标题：整条通知的视觉锚点
-  parts.push(`<h3>${esc(post.title)}</h3>`);
+  // 1) 标题本身是链接 —— 点击区域最大
+  parts.push(`<h3><a href="${link}">${esc(post.title)}</a></h3>`);
 
-  // 2) 摘要：独立成段，比引用块轻，不跟标题抢视线
-  if (summary) parts.push(`<p>${esc(summary)}</p>`);
+  // 2) 空行 + 引用块：让摘要与标题明确分区，并标注是 AI 生成
+  if (summary) {
+    parts.push(`<p>&nbsp;</p>`);
+    parts.push(`<blockquote>${esc(summary)}<cite>AI 摘要</cite></blockquote>`);
+  }
 
-  // 3) 元信息：压成一行小字
+  // 3) 分隔线 + 元信息一行小字
+  parts.push(`<hr/>`);
   const meta = [];
   if (dev) {
     meta.push(dev.remaining < 0 ? "🧪 Dev 模式" : dev.remaining > 0 ? `🧪 Dev 模式 · 剩余 ${dev.remaining} 条` : "🧪 Dev 模式 · 最后一条");
   }
-  meta.push(esc(cn), esc(post.author), `<a href="${esc(post.link)}">打开原帖</a>`);
+  meta.push(esc(cn), esc(post.author), `<a href="${link}">原帖</a>`);
   parts.push(`<footer>${meta.join(" · ")}</footer>`);
 
   // 4) 命中关键词：短的内联展开，长的默认折叠（避免长正则刷屏）
