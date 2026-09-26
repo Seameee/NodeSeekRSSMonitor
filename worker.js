@@ -257,7 +257,7 @@ function parseRSS(xml, sourceIndex = 0) {
 
 // 多源 RSS 获取：主源失败5次后切换到备用源
 async function fetchEntries(category = null, env = {}) {
-  const maxRetriesPerSource = 5;
+  const maxRetriesPerSource = 3;
   const timeout = 15000; // 15秒超时
 
   for (let sourceIndex = 0; sourceIndex < RSS_BACKUP_SOURCES.length; sourceIndex++) {
@@ -331,7 +331,16 @@ function matches(title, keyword, mode = "substring") {
 
 // ─── D1 存储层 ───────────────────────────────────────────────────────────────
 
-async function initDB(db) {
+async function initDB(db, force = false) {
+  // 建表是幂等的，但每分钟执行 4 条 DDL 纯属浪费，且实测是 D1 读取的主要来源。
+  // 用 settings.schema_ready 做一次性标记；force=true 时强制重跑（/setup 使用）。
+  if (!force) {
+    try {
+      if ((await getSetting(db, "schema_ready")) === "1") return;
+    } catch {
+      // settings 表尚不存在，继续走建表流程
+    }
+  }
   await db.batch([
     db.prepare(`CREATE TABLE IF NOT EXISTS keywords (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -353,7 +362,11 @@ async function initDB(db) {
     db.prepare(`CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY, value TEXT NOT NULL
     )`),
+    // 清理语句按 seen_at / sent_at 过滤，没有索引会全表扫描
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_seen_posts_seen_at ON seen_posts (seen_at)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_notifications_sent_at ON notifications (sent_at)"),
   ]);
+  await setSetting(db, "schema_ready", "1");
 }
 
 const now = () => new Date().toISOString();
@@ -366,16 +379,30 @@ async function setSetting(db, k, v) {
   await db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?1,?2)").bind(k, v).run();
 }
 
+// 一次读取多个 settings，替代多次往返
+async function getSettings(db, keys) {
+  const out = {};
+  if (!keys.length) return out;
+  const ph = keys.map((_, i) => `?${i + 1}`).join(",");
+  const r = await db.prepare(`SELECT key,value FROM settings WHERE key IN (${ph})`).bind(...keys).all();
+  for (const row of r.results || []) out[row.key] = row.value;
+  return out;
+}
+
 // ─── Dev 模式状态 ────────────────────────────────────────────────────────────
 // settings.dev_left：不存在/空串 = 关闭；-1 = 无限；N>0 = 还剩 N 条可推送
 const DEV_KEY = "dev_left";
 
-async function getDevState(db) {
-  const v = await getSetting(db, DEV_KEY);
-  if (v === null || v === "") return null;
+// 纯函数：把 settings.dev_left 的值解析成状态对象（便于配合 getSettings 批量读取）
+function devFromValue(v) {
+  if (v === null || v === undefined || v === "") return null;
   const n = parseInt(v, 10);
   if (!Number.isFinite(n) || n === 0) return null;
   return { left: n < 0 ? -1 : n };
+}
+
+async function getDevState(db) {
+  return devFromValue(await getSetting(db, DEV_KEY));
 }
 
 async function setDevState(db, left) {
@@ -425,8 +452,17 @@ async function setEnabled(db, kw, en) {
   return r.meta?.changes ?? 0;
 }
 
-async function isSeen(db, pid) {
-  return !!(await db.prepare("SELECT 1 FROM seen_posts WHERE post_id=?1").bind(pid).first());
+// 一次查出所有已见帖子，替代逐帖 SELECT（原来 20 帖要 20 次往返）。
+// D1 单条语句最多 100 个绑定参数，故按 100 分批。
+async function filterUnseen(db, ids) {
+  const seen = new Set();
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const ph = chunk.map((_, j) => `?${j + 1}`).join(",");
+    const r = await db.prepare(`SELECT post_id FROM seen_posts WHERE post_id IN (${ph})`).bind(...chunk).all();
+    for (const row of r.results || []) seen.add(row.post_id);
+  }
+  return seen;
 }
 
 async function markSeen(db, ids) {
@@ -451,13 +487,21 @@ async function getHistory(db, limit) {
   ).bind(limit).all()).results;
 }
 
-async function cleanup(db) {
-  const d7 = new Date(Date.now() - 7 * 86400000).toISOString();
-  const d30 = new Date(Date.now() - 30 * 86400000).toISOString();
+// 清理过期数据。已按 seen_at / sent_at 建索引，但仍不必每分钟执行，
+// 用 settings.last_cleanup 控制在每小时一次（lastCleanup 由调用方批量读出，避免额外往返）。
+const CLEANUP_INTERVAL_MS = 3600 * 1000;
+async function cleanup(db, lastCleanup) {
+  const t = Date.now();
+  const last = parseInt(lastCleanup || "0", 10);
+  if (last && t - last < CLEANUP_INTERVAL_MS) return false;
+  const d7 = new Date(t - 7 * 86400000).toISOString();
+  const d30 = new Date(t - 30 * 86400000).toISOString();
   await db.batch([
     db.prepare("DELETE FROM seen_posts WHERE seen_at < ?1").bind(d7),
     db.prepare("DELETE FROM notifications WHERE sent_at < ?1").bind(d30),
   ]);
+  await setSetting(db, "last_cleanup", String(t));
+  return true;
 }
 
 // ─── Telegram 命令处理 ───────────────────────────────────────────────────────
@@ -785,8 +829,11 @@ async function pollRSS(env) {
 
   await initDB(db);
 
+  // 本轮需要的 settings 一次读完（原来分散成 4 次往返）
+  const st = await getSettings(db, [DEV_KEY, "rss_fail_count", "initialized", "last_cleanup"]);
+
   // Dev 模式：暂停关键词过滤，任何新帖都推送（受条数与防洪上限约束）
-  const dev = await getDevState(db);
+  const dev = devFromValue(st[DEV_KEY]);
   const devBudget = dev ? (dev.left < 0 ? MAX_NOTIF : Math.min(dev.left, MAX_NOTIF)) : 0;
 
   const allKw = await listKeywords(db);
@@ -813,7 +860,7 @@ async function pollRSS(env) {
     }
   } catch (e) {
     console.error("RSS fetch failed:", e);
-    const fc = parseInt((await getSetting(db, "rss_fail_count")) || "0", 10) + 1;
+    const fc = parseInt(st["rss_fail_count"] || "0", 10) + 1;
     await setSetting(db, "rss_fail_count", String(fc));
     if (fc === FAIL_THRESHOLD) {
       const sourceList = RSS_BACKUP_SOURCES.map((url, i) => `${i + 1}. ${url}`).join('\n');
@@ -823,12 +870,15 @@ async function pollRSS(env) {
     }
     return;
   }
-  await setSetting(db, "rss_fail_count", "0");
+  // 仅在此前确有失败计数时才写回，正常情况省掉一次写入
+  if (parseInt(st["rss_fail_count"] || "0", 10) !== 0) {
+    await setSetting(db, "rss_fail_count", "0");
+  }
 
   if (!entries.size) return;
 
   // 首次运行：静默初始化
-  if ((await getSetting(db, "initialized")) !== "true") {
+  if (st["initialized"] !== "true") {
     console.log(`首次轮询，静默标记 ${entries.size} 篇帖子`);
     await markSeen(db, [...entries.keys()]);
     await setSetting(db, "initialized", "true");
@@ -836,13 +886,18 @@ async function pollRSS(env) {
   }
 
   // 匹配
+  const sorted = [...entries.entries()].sort((a, b) => a[0] - b[0]);
+  // 一次查出所有已见帖子，替代逐帖 SELECT
+  const seenSet = await filterUnseen(db, sorted.map(([pid]) => pid));
+
   const notifs = [];
-  for (const [pid, post] of [...entries.entries()].sort((a, b) => a[0] - b[0])) {
+  const consumed = []; // 本轮实际消费的帖子，最后统一批量写入
+  for (const [pid, post] of sorted) {
     // Dev 模式配额用满就停止消费：本轮剩余的帖子不标记已见，
     // 退出 Dev 模式后它们仍会被关键词正常评估，不会丢失。
     if (dev && notifs.length >= devBudget) break;
-    if (await isSeen(db, pid)) continue;
-    await markSeen(db, [pid]);
+    if (seenSet.has(pid)) continue;
+    consumed.push(pid);
 
     if (dev) {
       // Dev 模式：不做关键词匹配，全部推送
@@ -860,6 +915,9 @@ async function pollRSS(env) {
       .map((k) => k.keyword);
     if (matched.length) notifs.push({ post, matched });
   }
+
+  // 本轮消费的帖子一次性批量写入（原来每帖一次 batch）
+  if (consumed.length) await markSeen(db, consumed);
 
   if (!notifs.length) return;
   console.log(`发送 ${notifs.length} 条通知`);
@@ -934,7 +992,7 @@ async function pollRSS(env) {
     }
   }
 
-  await cleanup(db);
+  await cleanup(db, st["last_cleanup"]);
 }
 
 // ─── Worker 入口 ─────────────────────────────────────────────────────────────
@@ -947,7 +1005,7 @@ export default {
     // GET /setup — 一键初始化数据库 + 注册 Webhook
     if (url.pathname === "/setup") {
       try {
-        await initDB(env.DB);
+        await initDB(env.DB, true);
         const webhookUrl = `${url.origin}/webhook`;
         const body = { url: webhookUrl, allowed_updates: ["message"] };
         if (env.WEBHOOK_SECRET) body.secret_token = env.WEBHOOK_SECRET;
@@ -968,7 +1026,7 @@ export default {
       }
       const update = await request.json();
       if (update.message) {
-        await initDB(env.DB);
+        await initDB(env.DB, true);
         ctx.waitUntil(handleCommand(env, update.message));
       }
       return new Response("OK");
