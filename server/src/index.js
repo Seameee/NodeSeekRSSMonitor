@@ -109,7 +109,9 @@ async function startBot() {
   const del = await deleteWebhook();
   if (!del.ok) log.warn("bot", `deleteWebhook 失败: ${del.description}`);
 
-  await setMyCommands(BOT_MENU.map(([command, description]) => ({ command, description })));
+  const menu = await setMyCommands(BOT_MENU.map(([command, description]) => ({ command, description })));
+  // 命令菜单失败不影响轮询，但会静默地少个入口，必须留痕
+  if (!menu.ok) log.warn("bot", `setMyCommands 失败: ${menu.description || "未知"}`);
 
   let offset = 0;
   let backoff = 1000;

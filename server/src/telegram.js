@@ -90,8 +90,11 @@ export async function tg(method, body, { retries = 3, timeoutMs = 20_000 } = {})
         continue;
       }
 
-      // 4xx 属于请求本身有问题，重试无意义
+      // 4xx 属于请求本身有问题，重试无意义。
+      // 但必须记下来：这类失败此前是完全静默的，症状是"发命令没反应"却查不到
+      // 任何线索（例如正文里有个非法标签会被 400 拒收，或命令描述字数不达标）。
       if (resp.status >= 400 && resp.status < 500) {
+        log.warn("tg", `${method} 被拒绝（HTTP ${resp.status}）: ${data.description || "无描述"}`);
         return data;
       }
       lastErr = new Error(`${resp.status}: ${data.description || "未知错误"}`);

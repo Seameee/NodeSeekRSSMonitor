@@ -78,7 +78,7 @@ export const BOT_MENU = [
   ["ai", "配置 AI 摘要"],
   ["status", "我的状态"],
   ["history", "推送记录"],
-  ["help", "帮助"],
+  ["help", "查看帮助"],
 ];
 
 /** 渲染成一行行「· 命令 — 说明」 */
