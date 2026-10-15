@@ -1,22 +1,44 @@
 # NodeSeek 关键词监控 Bot
 
-基于 Cloudflare Workers + D1 的 NodeSeek 论坛关键词监控机器人，命中关键词的新帖通过 Telegram 推送。
+NodeSeek 论坛关键词监控机器人：轮询 RSS，命中关键词的新帖通过 Telegram 推送，可选 AI 摘要。
+
+提供两种部署方式，功能与数据模型一致，按需要选一个：
+
+| 部署方式 | 运行环境 | 用户模型 | 适合场景 |
+| --- | --- | --- | --- |
+| **Docker（推荐）** | 任意 VPS / 家庭服务器，原生 Node.js | **多用户**，每人独立关键词与 AI 配置 | 想给多人用、要数据自主、不想受平台限制 |
+| Cloudflare Workers | Cloudflare 边缘网络 + D1 | 单用户 | 零成本、零运维、不想管服务器 |
 
 > 本项目派生自 [Roddy-D/NodeSeekRSSMonitor](https://github.com/Roddy-D/NodeSeekRSSMonitor)，署名与授权说明见文末[来源与致谢](#来源与致谢)。
 
 ## 功能
 
+两种部署方式共有的功能：
+
 - 关键词监控：支持子串匹配与正则匹配，可按版块过滤
 - 每分钟轮询 RSS，新帖命中关键词后推送通知
 - 通知使用 Bot API 10.3 富文本消息：标题可点击、关键词可折叠；接口不可用时自动降级为经典 HTML
-- 可选 AI 摘要：为通知附加一句帖子内容摘要，支持多级备用模型回退
-- Dev 模式：临时关闭关键词过滤，任何新帖都推送，用于调试
-- 防洪控制：每轮最多推送 10 条，超出部分合并为一条汇总消息
-- 多源容错：主 RSS 源连续失败后自动切换备用源
+- 可选 AI 摘要：为通知附加一句帖子内容摘要，支持多级备用模型回退，并标注实际使用的模型
+- 防洪控制：每轮推送有上限，超出部分合并为一条汇总消息
+- 多源容错：主 RSS 源失败后自动切换备用源
 - 首次运行静默初始化，不推送历史帖子
-- 自动清理数据：已见帖子保留 7 天，推送记录保留 30 天
+- 自动清理过期数据
+
+**Docker 版额外提供**（详见 [Docker 部署](#docker-部署多用户)）：
+
+- 多用户：任何人可在 Telegram 里 `/bind` 自助开通，各自拥有独立的关键词与 AI 配置
+- 角色分离：普通用户只能管理自己的关键词与 AI；管理员独占用户管理、配额、封禁等能力
+- 密钥加密：用户 API Key 以 AES-256-GCM 加密落库，明文不落盘、不进日志
+- 防滥用：命令限流、日配额、注册冷却、ReDoS 防护与全局并发控制
+- 多线程：CPU 密集的 XML 解析与正则匹配放进 worker 线程池，主线程始终响应命令
 
 ## 部署
+
+### 方式一：Docker Compose（多用户）
+
+见 [Docker 部署](#docker-部署多用户)。
+
+### 方式二：Cloudflare Workers（单用户）
 
 1. Cloudflare Dashboard → Workers & Pages → Create，选择 Hello World 模板
 2. Settings → Variables and Secrets，添加基础环境变量
@@ -35,6 +57,364 @@
 | `WEBHOOK_SECRET`     | 否   | Webhook 校验串，建议设置                         |
 
 建议将上述变量以 Secret 类型保存，避免在控制台明文可见。
+
+## Docker 部署（多用户）
+
+原生 Node.js 实现，不使用 Wrangler，也不依赖 Cloudflare。跑在你自己的服务器上，支持多用户。
+
+### 与 Workers 版的区别
+
+| 维度 | Docker 版 | Workers 版 |
+| --- | --- | --- |
+| 运行环境 | 你的服务器（Node.js 22.5+） | Cloudflare 边缘 |
+| 数据库 | 本地 SQLite（WAL） | Cloudflare D1 |
+| 用户模型 | 多用户，各自独立配置 | 单用户 |
+| 通信方式 | 长轮询 `getUpdates` | Webhook |
+| 第三方依赖 | **零**（含 SQLite 驱动，全用 Node 内置模块） | 零 |
+| 成本 | 自己的服务器 | 免费额度内免费 |
+
+### 系统要求
+
+- Docker 20.10+ 与 Docker Compose v2（`docker compose` 命令）
+- 内存 128 MB 起，单核即可支撑数百用户（瓶颈在网络 I/O，不在 CPU）
+- 能访问 `api.telegram.org` 与 `rss.nodeseek.com` 的网络
+
+### 快速开始
+
+**1. 准备目录**
+
+```bash
+mkdir -p ~/nodeseek-monitor && cd ~/nodeseek-monitor
+```
+
+**2. 创建 `.env`**
+
+```bash
+cat > .env <<'EOF'
+# 从 @BotFather 获取
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+
+# 你的 Telegram 用户 ID，从 @userinfobot 获取；多个用英文逗号分隔
+ADMIN_TELEGRAM_IDS=123456789
+
+# 主密钥：加密用户 API Key 用，务必先备份
+APP_MASTER_KEY=replace_me_with_openssl_rand_hex_32
+EOF
+chmod 600 .env
+```
+
+生成主密钥并直接写进文件：
+
+```bash
+sed -i "s|^APP_MASTER_KEY=.*|APP_MASTER_KEY=$(openssl rand -hex 32)|" .env
+```
+
+**3. 创建 `compose.yaml`**
+
+```bash
+cat > compose.yaml <<'EOF'
+services:
+  nodeseek-monitor:
+    image: ghcr.io/seameee/nodeseek-monitor:latest
+    container_name: nodeseek-monitor
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+```
+
+**4. 启动**
+
+```bash
+docker compose up -d
+docker compose logs -f
+```
+
+看到 `健康检查监听 :8787/healthz` 与第一轮轮询日志即为正常。
+
+**5. 开始使用**
+
+在 Telegram 里给 Bot 发 `/bind` 开通账号，然后：
+
+```
+/add 绿云              # 添加关键词
+/list                  # 查看
+/ai set sk-xxx         # 可选，配置 AI 摘要
+```
+
+### 从源码构建镜像
+
+不想用预构建镜像时，把 `compose.yaml` 里的 `image:` 换成：
+
+```yaml
+    build:
+      context: https://github.com/Seameee/NodeSeekRSSMonitor.git#main:server
+```
+
+或本地克隆后：
+
+```bash
+cd server
+docker compose up -d --build
+```
+
+### 环境变量
+
+必填项：
+
+| 名称 | 说明 |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Bot Token，从 [@BotFather](https://t.me/BotFather) 获取 |
+| `ADMIN_TELEGRAM_IDS` | 管理员用户 ID，逗号分隔。**只有列在这里的人能用 `/admin`** |
+| `APP_MASTER_KEY` | 加密用户 API Key 的主密钥，`openssl rand -hex 32` 生成 |
+
+> `APP_MASTER_KEY` **一旦设定不可更改**。改了之后所有用户已保存的 API Key 都无法解密，用户需要重新 `/ai set`。请与数据库一起备份。
+
+常用可选项（完整列表见 `server/.env.example`）：
+
+| 名称 | 默认 | 说明 |
+| --- | --- | --- |
+| `POLL_INTERVAL_MS` | `60000` | 轮询间隔，最小 10000 |
+| `REGISTRATION_OPEN` | `true` | 是否允许自助 `/bind`；设为 `false` 则只有管理员能开通 |
+| `MAX_USERS` | `200` | 用户总数上限 |
+| `DEFAULT_MAX_KEYWORDS` | `20` | 新用户关键词数量上限 |
+| `DEFAULT_DAILY_AI_QUOTA` | `100` | 新用户每日 AI 调用上限 |
+| `DEFAULT_DAILY_PUSH_QUOTA` | `200` | 新用户每日推送条数上限 |
+| `COMMAND_RATE_PER_MIN` | `20` | 每用户每分钟命令数上限 |
+| `WORKER_POOL_SIZE` | `4` | worker 线程数；设 `0` 则退化为单线程 |
+| `AI_CONCURRENCY` | `8` | 同时在飞的 AI 请求数 |
+| `SEND_RATE_PER_SEC` | `20` | 全局 Telegram 发送速率 |
+| `ALLOW_GROUP_CHATS` | `false` | 是否允许群聊中使用 |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+
+### 命令一览
+
+**所有用户**
+
+| 命令 | 说明 |
+| --- | --- |
+| `/bind` | 开通账号（自助注册） |
+| `/add <关键词> [版块] [--regex]` | 添加关键词 |
+| `/remove <序号\|关键词>` | 删除关键词 |
+| `/pause` / `/resume <序号\|关键词>` | 暂停 / 恢复关键词 |
+| `/list` | 查看自己的关键词 |
+| `/categories` | 查看可用版块 |
+| `/ai set <key> [模型] [base_url]` | 配置 AI 摘要 |
+| `/ai fallback <模型1,模型2>` | 设置备用模型链 |
+| `/ai test` | 连通性测试 |
+| `/ai status` / `/ai on` / `/ai off` / `/ai clear` | 查看 / 开关 / 清除 |
+| `/status` | 我的状态与今日用量 |
+| `/history [数量]` | 我的推送记录 |
+| `/help` | 帮助 |
+
+**仅管理员**
+
+| 命令 | 说明 |
+| --- | --- |
+| `/admin` | 管理面板 |
+| `/admin users [页码]` | 用户列表 |
+| `/admin find <ID\|用户名>` | 搜索用户 |
+| `/admin info <id>` | 用户详情（含用量、AI 配置状态） |
+| `/admin ban` / `/admin unban <id>` | 封禁 / 解封 |
+| `/admin quota <id> kw\|ai\|push <数值>` | 设置配额，`-1` 恢复默认 |
+| `/admin note <id> <备注>` | 打标记 |
+| `/admin del <id>` | 删除用户及其全部数据 |
+| `/admin stats` | 全局统计与运行时状态 |
+| `/admin open on\|off` | 开关注册 |
+| `/admin audit` | 最近管理操作 |
+
+### 权限模型
+
+```
+未注册用户 ──► 只放行 /start /help /bind
+     │
+     ▼ /bind
+普通用户 ────► 只能操作自己的关键词与 AI 配置
+     │         所有读写都带 telegram_id 条件，数据库层面无法跨用户
+     ▼
+管理员 ──────► 用户管理、配额、封禁、全局设置
+               必须是 ADMIN_TELEGRAM_IDS 白名单成员
+               库里的 role=admin 字段单独篡改无效
+```
+
+要开关注册，把 `REGISTRATION_OPEN` 设为 `false`；此后新用户 `/bind` 会被拒绝，需要管理员手动在数据库里插入，或临时打开开关让其自助注册。
+
+### 安全设计
+
+**密钥加密**
+
+用户的 API Key 用 **AES-256-GCM** 加密后存库：
+
+- 格式 `v1:<iv>:<认证标签>:<密文>`，每次加密用独立随机 IV，相同明文产生不同密文
+- GCM 的认证标签可检测密文被篡改
+- 全库导出、SQL 注入或备份泄漏都拿不到明文
+- `APP_MASTER_KEY` 只存在于环境变量，从不落盘、不进日志
+
+> 关于「单向加密」：API Key 必须能被**还原**后才能拿去调用上游模型，因此只能用可逆的对称加密，不能用散列。用 SHA-256 之类单向散列存 Key，等于把 Key 丢掉、功能直接用不了。代码里 `hashSecret` / `safeEqual` 这对单向函数保留给「只需校验、无需还原」的场景。
+
+**日志脱敏**
+
+`logger.js` 对所有输出做模式匹配打码（`sk-`、`ghp_`、`Bearer`、URL 里的 token/key 等），Key 不会因为某个 `console.log` 而泄漏。
+
+**ReDoS 防护**
+
+关键词正则是用户可控输入，一个 `(a+)+$` 就能把事件循环钉死。三层防护：
+
+1. 长度上限 `MAX_REGEX_LEN`
+2. 静态分析拒绝嵌套量词、反向引用等回溯炸弹结构
+3. 实际匹配跑在 worker 线程里并带硬超时，超时即终止该 worker 并重建，主进程不受影响
+
+**SSRF 防护**
+
+`/ai set` 的 `base_url` 会校验协议并拒绝解析到内网/本机地址（`127.`、`10.`、`192.168.`、`169.254.`、`localhost`、`::1` 等）。
+
+**容器加固**
+
+compose 里默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件系统（仅 `/data` 与 `/tmp` 可写）、非 root 用户运行、tini 作为 PID 1 确保 `SIGTERM` 触发优雅退出。
+
+### 防滥用
+
+多用户服务最大的风险是被刷。默认策略：
+
+| 层面 | 机制 | 默认值 |
+| --- | --- | --- |
+| 命令频率 | 每用户令牌桶 | 20 条/分钟 |
+| 注册 | 冷却时间 + 总人数上限 | 30 秒 / 200 人 |
+| 资源消耗 | 每用户每日 AI 调用配额 | 100 次 |
+| 推送量 | 每用户每日推送配额 | 200 条 |
+| 关键词数量 | 每用户上限 | 20 条 |
+| 单轮规模 | 单用户单轮推送上限 | 10 条（超出合并汇总） |
+| 全局限流 | Telegram 发送速率 | 20 条/秒 |
+
+超限时的行为：命令限流会静默丢弃（只偶尔提示，避免限流本身变成放大器）；日配额用尽当天只提示一次。
+
+管理员可用 `/admin quota <id> ai 500` 给可信用户放宽。
+
+### 性能设计
+
+多用户下真正重要的是**别让用户数乘上网络开销**。
+
+**一轮只抓一次 RSS**
+
+```
+抓取（1 次，与用户数无关）
+   └─► 解析（worker 线程，1 次）
+         └─► 内存匹配（每用户，纯内存操作）
+               └─► AI 摘要（仅有配额且已配置的用户）
+                     └─► 发送（每用户，受全局限速）
+```
+
+100 个用户和 1 个用户在**网络抓取**上的开销完全相同，只有内存匹配量随用户数线性增长。
+
+**并发控制**
+
+| 环节 | 机制 |
+| --- | --- |
+| CPU（解析 + 正则匹配） | worker 线程池，主线程不被拖住 |
+| AI 请求 | 信号量限制同时在飞数量 |
+| Telegram 发送 | 全局令牌桶 + 每 chat 串行（保证同一用户消息有序） |
+| 用户间处理 | 分批推进，避免一次性展开所有用户的任务 |
+
+**数据库**
+
+- WAL 模式，读写不互斥，轮询写库不阻塞用户命令
+- 预编译语句缓存，避免重复编译
+- 索引覆盖热路径：`seen_posts(telegram_id,seen_at)`、`keywords(telegram_id,enabled)`、`notifications(telegram_id,sent_at)`
+- 关键词列表按修订号缓存，改动时才失效
+- 已见帖子批量查询与写入，一轮一次往返
+
+### 数据与备份
+
+所有数据都在 `./data/nodeseek.db`（外加 WAL/SHM 文件）。备份：
+
+```bash
+docker compose stop
+tar czf nodeseek-backup-$(date +%F).tar.gz data/ .env
+docker compose start
+```
+
+**一定要连 `.env` 一起备份** —— 没有 `APP_MASTER_KEY`，数据库里的 API Key 就是一堆无法解密的密文。
+
+恢复：
+
+```bash
+docker compose down
+tar xzf nodeseek-backup-YYYY-MM-DD.tar.gz
+docker compose up -d
+```
+
+### 升级
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+数据库 schema 用 `CREATE TABLE IF NOT EXISTS` 幂等创建，直接升级即可。
+
+### 健康检查与排障
+
+容器内置健康检查，`docker compose ps` 显示 `healthy` 即正常。手动查看运行时状态：
+
+```bash
+docker compose exec nodeseek-monitor curl -s localhost:8787/healthz | head
+```
+
+返回 JSON 含最近一轮耗时、推送数、worker 池状态、限流表大小等。
+
+常见问题：
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| 日志出现 `409 Conflict` | 同一个 Bot Token 在别处也在长轮询。停掉另一处（包括旧 Worker 的 Webhook）即可 |
+| 收不到推送 | 先在 Telegram 发 `/status` 看配额；`/list` 确认关键词已添加且未暂停 |
+| 通知里没有 AI 摘要 | `/ai status` 看配置；日志搜 `[ai]`；确认该帖有正文（约 20% 的帖子被作者设为「仅注册用户可见」，取不到正文，会跳过摘要） |
+| 日志 `API Key 无法解密` | `APP_MASTER_KEY` 被改过。让该用户重新 `/ai set` |
+| 内存持续增长 | 检查 `WORKER_POOL_SIZE` 与 `AI_CONCURRENCY`；worker 超时会重建，正常不会泄漏 |
+
+### 不用 Compose 直接跑
+
+```bash
+docker run -d --name nodeseek-monitor \
+  --restart unless-stopped \
+  -e TELEGRAM_BOT_TOKEN=xxx \
+  -e ADMIN_TELEGRAM_IDS=123456789 \
+  -e APP_MASTER_KEY=$(openssl rand -hex 32) \
+  -v "$PWD/data:/data" \
+  --read-only --tmpfs /tmp:size=16m \
+  --security-opt no-new-privileges --cap-drop ALL \
+  ghcr.io/seameee/nodeseek-monitor:latest
+```
+
+或完全不用 Docker：
+
+```bash
+cd server
+APP_MASTER_KEY=$(openssl rand -hex 32) \
+TELEGRAM_BOT_TOKEN=xxx \
+ADMIN_TELEGRAM_IDS=123456789 \
+DB_PATH=./data/nodeseek.db \
+node src/index.js
+```
+
+需要 Node.js 22.5 以上（用到内置的 `node:sqlite`），无需 `npm install`。
 
 ## AI 摘要（可选）
 
@@ -202,6 +582,17 @@ Workers 免费版的约束是 **每次调用 10ms CPU** 与 **50 个子请求**�
 | `LICENSE`                 | MIT 许可证，仅覆盖本仓库新增与修改的部分                      |
 | `NOTICE`                  | 上游来源与授权范围划分说明                                    |
 | `Dockerfile`              | 用于容器化部署上述代理服务                                   |
+
+Docker 多用户版的全部文件在 `server/` 目录：
+
+| 文件/目录                      | 用途                                                       |
+| ------------------------------ | ---------------------------------------------------------- |
+| `server/src/`                  | 服务端源码（18 个模块，零第三方依赖）                       |
+| `server/Dockerfile`            | 多阶段构建，基于 `node:24-alpine`，非 root 运行             |
+| `server/docker-compose.yml`    | Compose 部署编排，含安全加固与资源限制                      |
+| `server/.env.example`          | 环境变量模板，含全部可调项与说明                            |
+| `server/test/`                 | 测试套件（41 项，覆盖加密、隔离、权限、轮询与配额）          |
+| `.github/workflows/docker.yml` | 自动构建多架构镜像并推送到 GHCR                             |
 
 ## 数据表
 

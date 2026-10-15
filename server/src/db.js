@@ -1,0 +1,483 @@
+// ============================================================================
+// SQLite 存储层
+//
+// 多用户隔离靠数据模型保证：所有用户级表都以 telegram_id 作为主键/前缀，
+// 任何查询都必须带 telegram_id 条件，不存在「先查出全部再过滤」的写法。
+//
+// 性能要点：
+//   · WAL 模式 —— 读写不互斥，轮询写库不阻塞命令查询
+//   · synchronous=NORMAL —— WAL 下兼顾安全与吞吐
+//   · 预编译语句缓存 —— 避免每分钟重复编译同一批 SQL
+//   · 索引覆盖热路径：seen_posts(telegram_id,seen_at)、keywords(telegram_id,enabled)
+// ============================================================================
+import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { config } from "./config.js";
+import { log } from "./logger.js";
+
+mkdirSync(dirname(config.dbPath), { recursive: true });
+
+export const db = new DatabaseSync(config.dbPath);
+
+// ─── 初始化 ──────────────────────────────────────────────────────────────────
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  telegram_id       INTEGER PRIMARY KEY,
+  username          TEXT,
+  display_name      TEXT,
+  role              TEXT    NOT NULL DEFAULT 'user',
+  status            TEXT    NOT NULL DEFAULT 'active',
+  created_at        TEXT    NOT NULL,
+  last_seen_at      TEXT,
+  max_keywords      INTEGER,
+  daily_ai_quota    INTEGER,
+  daily_push_quota  INTEGER,
+  note              TEXT
+);
+
+CREATE TABLE IF NOT EXISTS keywords (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_id  INTEGER NOT NULL,
+  keyword      TEXT    NOT NULL,
+  category     TEXT,
+  match_mode   TEXT    NOT NULL DEFAULT 'substring',
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  created_at   TEXT    NOT NULL,
+  UNIQUE(telegram_id, keyword, category)
+);
+CREATE INDEX IF NOT EXISTS idx_keywords_user ON keywords(telegram_id, enabled);
+
+CREATE TABLE IF NOT EXISTS ai_configs (
+  telegram_id   INTEGER PRIMARY KEY,
+  base_url      TEXT    NOT NULL,
+  api_key_enc   TEXT    NOT NULL,
+  api_key_hint  TEXT    NOT NULL,
+  model         TEXT    NOT NULL,
+  fallback      TEXT,
+  min_len       INTEGER NOT NULL DEFAULT 0,
+  max_per_round INTEGER NOT NULL DEFAULT 5,
+  max_tokens    INTEGER NOT NULL DEFAULT 4000,
+  timeout_ms    INTEGER NOT NULL DEFAULT 15000,
+  prompt        TEXT,
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  updated_at    TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seen_posts (
+  telegram_id INTEGER NOT NULL,
+  post_id     INTEGER NOT NULL,
+  seen_at     TEXT    NOT NULL,
+  PRIMARY KEY (telegram_id, post_id)
+);
+CREATE INDEX IF NOT EXISTS idx_seen_user_time ON seen_posts(telegram_id, seen_at);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_id INTEGER NOT NULL,
+  post_id     INTEGER NOT NULL,
+  keyword     TEXT    NOT NULL,
+  title       TEXT    NOT NULL,
+  link        TEXT    NOT NULL,
+  category    TEXT    NOT NULL,
+  author      TEXT    NOT NULL,
+  status      TEXT    NOT NULL DEFAULT 'sent',
+  sent_at     TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notif_user_time ON notifications(telegram_id, sent_at);
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+  telegram_id INTEGER NOT NULL,
+  day         TEXT    NOT NULL,
+  ai_calls    INTEGER NOT NULL DEFAULT 0,
+  pushes      INTEGER NOT NULL DEFAULT 0,
+  commands    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (telegram_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor_id   INTEGER NOT NULL,
+  action     TEXT    NOT NULL,
+  target_id  INTEGER,
+  detail     TEXT,
+  created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(created_at);
+
+CREATE TABLE IF NOT EXISTS rss_state (
+  url           TEXT PRIMARY KEY,
+  etag          TEXT,
+  last_modified TEXT,
+  last_ok_at    TEXT,
+  fail_count    INTEGER NOT NULL DEFAULT 0
+);
+`;
+
+db.exec("PRAGMA journal_mode = WAL");
+db.exec("PRAGMA synchronous = NORMAL");
+db.exec("PRAGMA foreign_keys = ON");
+db.exec("PRAGMA busy_timeout = 5000");
+db.exec("PRAGMA temp_store = MEMORY");
+db.exec(SCHEMA);
+
+// ─── 预编译语句缓存 ──────────────────────────────────────────────────────────
+
+const stmtCache = new Map();
+function prep(sql) {
+  let s = stmtCache.get(sql);
+  if (!s) {
+    s = db.prepare(sql);
+    stmtCache.set(sql, s);
+  }
+  return s;
+}
+
+export const now = () => new Date().toISOString();
+export const today = () => new Date().toISOString().slice(0, 10);
+
+// ─── settings ────────────────────────────────────────────────────────────────
+
+export function getSetting(key, def = null) {
+  const row = prep("SELECT value FROM settings WHERE key=?").get(key);
+  return row ? row.value : def;
+}
+
+export function setSetting(key, value) {
+  prep("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(
+    key,
+    String(value)
+  );
+}
+
+export function getSettings(keys) {
+  if (!keys.length) return {};
+  const ph = keys.map(() => "?").join(",");
+  const rows = prep(`SELECT key,value FROM settings WHERE key IN (${ph})`).all(...keys);
+  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+}
+
+// ─── 用户 ────────────────────────────────────────────────────────────────────
+
+export function getUser(telegramId) {
+  return prep("SELECT * FROM users WHERE telegram_id=?").get(telegramId) || null;
+}
+
+export function countUsers() {
+  return prep("SELECT COUNT(*) AS n FROM users").get().n;
+}
+
+export function listUsers({ limit = 50, offset = 0, status = null } = {}) {
+  if (status) {
+    return prep(
+      "SELECT * FROM users WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    ).all(status, limit, offset);
+  }
+  return prep("SELECT * FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+}
+
+/** 创建用户；已存在则返回 null（由调用方决定提示语） */
+export function createUser({ telegramId, username, displayName, role = "user" }) {
+  const r = prep(
+    `INSERT OR IGNORE INTO users (telegram_id,username,display_name,role,status,created_at,last_seen_at)
+     VALUES (?,?,?,?, 'active', ?, ?)`
+  ).run(telegramId, username || null, displayName || null, role, now(), now());
+  return r.changes > 0 ? getUser(telegramId) : null;
+}
+
+export function touchUser(telegramId, username, displayName) {
+  prep("UPDATE users SET last_seen_at=?, username=COALESCE(?,username), display_name=COALESCE(?,display_name) WHERE telegram_id=?").run(
+    now(),
+    username || null,
+    displayName || null,
+    telegramId
+  );
+}
+
+export function setUserStatus(telegramId, status) {
+  return prep("UPDATE users SET status=? WHERE telegram_id=?").run(status, telegramId).changes;
+}
+
+export function setUserQuota(telegramId, field, value) {
+  if (!["max_keywords", "daily_ai_quota", "daily_push_quota"].includes(field)) {
+    throw new Error(`不允许修改的配额字段: ${field}`);
+  }
+  return prep(`UPDATE users SET ${field}=? WHERE telegram_id=?`).run(value, telegramId).changes;
+}
+
+export function setUserNote(telegramId, note) {
+  return prep("UPDATE users SET note=? WHERE telegram_id=?").run(note, telegramId).changes;
+}
+
+export function deleteUser(telegramId) {
+  db.exec("BEGIN");
+  try {
+    for (const t of ["keywords", "ai_configs", "seen_posts", "notifications", "usage_daily"]) {
+      prep(`DELETE FROM ${t} WHERE telegram_id=?`).run(telegramId);
+    }
+    const n = prep("DELETE FROM users WHERE telegram_id=?").run(telegramId).changes;
+    db.exec("COMMIT");
+    return n;
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+/** 解析用户的生效配额：用户级覆盖优先，否则用全局默认 */
+export function effectiveQuota(user) {
+  return {
+    maxKeywords: user.max_keywords ?? config.defaultMaxKeywords,
+    dailyAi: user.daily_ai_quota ?? config.defaultDailyAiQuota,
+    dailyPush: user.daily_push_quota ?? config.defaultDailyPushQuota,
+  };
+}
+
+// ─── 关键词 ──────────────────────────────────────────────────────────────────
+
+export function listKeywords(telegramId, { onlyEnabled = false } = {}) {
+  const sql = onlyEnabled
+    ? "SELECT * FROM keywords WHERE telegram_id=? AND enabled=1 ORDER BY id"
+    : "SELECT * FROM keywords WHERE telegram_id=? ORDER BY id";
+  return prep(sql).all(telegramId);
+}
+
+export function countKeywords(telegramId) {
+  return prep("SELECT COUNT(*) AS n FROM keywords WHERE telegram_id=?").get(telegramId).n;
+}
+
+export function addKeyword(telegramId, keyword, category, matchMode) {
+  try {
+    const r = prep(
+      "INSERT INTO keywords (telegram_id,keyword,category,match_mode,enabled,created_at) VALUES (?,?,?,?,1,?)"
+    ).run(telegramId, keyword, category, matchMode, now());
+    return { id: r.lastInsertRowid };
+  } catch (e) {
+    if (String(e.message).includes("UNIQUE")) return { duplicate: true };
+    throw e;
+  }
+}
+
+export function removeKeywordById(telegramId, id) {
+  return prep("DELETE FROM keywords WHERE telegram_id=? AND id=?").run(telegramId, id).changes;
+}
+
+export function setKeywordEnabled(telegramId, id, enabled) {
+  return prep("UPDATE keywords SET enabled=? WHERE telegram_id=? AND id=?").run(
+    enabled ? 1 : 0,
+    telegramId,
+    id
+  ).changes;
+}
+
+/** 改动关键词后需要让匹配缓存失效 */
+export const keywordRevisionKey = (telegramId) => `kwrev:${telegramId}`;
+
+export function bumpKeywordRevision(telegramId) {
+  const next = Number.parseInt(getSetting(keywordRevisionKey(telegramId), "0"), 10) + 1;
+  setSetting(keywordRevisionKey(telegramId), String(next));
+  return next;
+}
+
+// ─── AI 配置 ─────────────────────────────────────────────────────────────────
+
+export function getAiConfig(telegramId) {
+  return prep("SELECT * FROM ai_configs WHERE telegram_id=?").get(telegramId) || null;
+}
+
+export function upsertAiConfig(telegramId, cfg) {
+  prep(
+    `INSERT INTO ai_configs
+       (telegram_id,base_url,api_key_enc,api_key_hint,model,fallback,min_len,max_per_round,max_tokens,timeout_ms,prompt,enabled,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(telegram_id) DO UPDATE SET
+       base_url=excluded.base_url, api_key_enc=excluded.api_key_enc, api_key_hint=excluded.api_key_hint,
+       model=excluded.model, fallback=excluded.fallback, min_len=excluded.min_len,
+       max_per_round=excluded.max_per_round, max_tokens=excluded.max_tokens,
+       timeout_ms=excluded.timeout_ms, prompt=excluded.prompt, enabled=excluded.enabled,
+       updated_at=excluded.updated_at`
+  ).run(
+    telegramId,
+    cfg.baseUrl,
+    cfg.apiKeyEnc,
+    cfg.apiKeyHint,
+    cfg.model,
+    cfg.fallback || null,
+    cfg.minLen ?? 0,
+    cfg.maxPerRound ?? 5,
+    cfg.maxTokens ?? 4000,
+    cfg.timeoutMs ?? 15000,
+    cfg.prompt || null,
+    cfg.enabled === false ? 0 : 1,
+    now()
+  );
+}
+
+export function deleteAiConfig(telegramId) {
+  return prep("DELETE FROM ai_configs WHERE telegram_id=?").run(telegramId).changes;
+}
+
+/** 一次性取出所有启用了 AI 的配置，供轮询器批量处理，避免 N 次查询 */
+export function listEnabledAiConfigs() {
+  return prep(
+    `SELECT a.* FROM ai_configs a
+     JOIN users u ON u.telegram_id = a.telegram_id
+     WHERE a.enabled=1 AND u.status='active'`
+  ).all();
+}
+
+// ─── 已见帖子 ────────────────────────────────────────────────────────────────
+
+/** 一次查出某用户已看过的帖子 ID 集合 */
+export function filterUnseen(telegramId, postIds) {
+  const seen = new Set();
+  if (!postIds.length) return seen;
+  // SQLite 变量上限较高，但保守按 400 分批
+  for (let i = 0; i < postIds.length; i += 400) {
+    const chunk = postIds.slice(i, i + 400);
+    const ph = chunk.map(() => "?").join(",");
+    const rows = prep(
+      `SELECT post_id FROM seen_posts WHERE telegram_id=? AND post_id IN (${ph})`
+    ).all(telegramId, ...chunk);
+    for (const r of rows) seen.add(r.post_id);
+  }
+  return seen;
+}
+
+export function markSeen(telegramId, postIds) {
+  if (!postIds.length) return;
+  const ts = now();
+  const stmt = prep("INSERT OR IGNORE INTO seen_posts (telegram_id,post_id,seen_at) VALUES (?,?,?)");
+  db.exec("BEGIN");
+  try {
+    for (const id of postIds) stmt.run(telegramId, id, ts);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+// ─── 推送历史 ────────────────────────────────────────────────────────────────
+
+export function logNotification(telegramId, post, keyword, status) {
+  prep(
+    `INSERT INTO notifications (telegram_id,post_id,keyword,title,link,category,author,status,sent_at)
+     VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(telegramId, post.post_id, keyword, post.title, post.link, post.category, post.author, status, now());
+}
+
+export function getHistory(telegramId, limit = 10) {
+  return prep(
+    `SELECT post_id, GROUP_CONCAT(DISTINCT keyword) AS keywords,
+            title, link, category, author, MIN(status) AS status, MAX(sent_at) AS sent_at
+     FROM notifications WHERE telegram_id=? GROUP BY post_id ORDER BY sent_at DESC LIMIT ?`
+  ).all(telegramId, limit);
+}
+
+// ─── 用量与配额 ──────────────────────────────────────────────────────────────
+
+export function getUsage(telegramId, day = today()) {
+  return (
+    prep("SELECT * FROM usage_daily WHERE telegram_id=? AND day=?").get(telegramId, day) || {
+      telegram_id: telegramId,
+      day,
+      ai_calls: 0,
+      pushes: 0,
+      commands: 0,
+    }
+  );
+}
+
+export function incrUsage(telegramId, field, delta = 1, day = today()) {
+  if (!["ai_calls", "pushes", "commands"].includes(field)) {
+    throw new Error(`不允许自增的用量字段: ${field}`);
+  }
+  prep(
+    `INSERT INTO usage_daily (telegram_id,day,${field}) VALUES (?,?,?)
+     ON CONFLICT(telegram_id,day) DO UPDATE SET ${field} = ${field} + excluded.${field}`
+  ).run(telegramId, day, delta);
+}
+
+export function totalUsage() {
+  const r = prep(
+    "SELECT COALESCE(SUM(ai_calls),0) AS ai, COALESCE(SUM(pushes),0) AS pushes FROM usage_daily WHERE day=?"
+  ).get(today());
+  return { aiCalls: r.ai, pushes: r.pushes };
+}
+
+// ─── 审计 ────────────────────────────────────────────────────────────────────
+
+export function audit(actorId, action, targetId = null, detail = null) {
+  prep("INSERT INTO audit_log (actor_id,action,target_id,detail,created_at) VALUES (?,?,?,?,?)").run(
+    actorId,
+    action,
+    targetId,
+    detail ? String(detail).slice(0, 500) : null,
+    now()
+  );
+}
+
+export function listAudit(limit = 20) {
+  return prep("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?").all(limit);
+}
+
+// ─── RSS 源状态 ──────────────────────────────────────────────────────────────
+
+export function getRssState(url) {
+  return prep("SELECT * FROM rss_state WHERE url=?").get(url) || null;
+}
+
+export function setRssState(url, { etag, lastModified, ok }) {
+  const prev = getRssState(url);
+  const failCount = ok ? 0 : (prev?.fail_count ?? 0) + 1;
+  prep(
+    `INSERT INTO rss_state (url,etag,last_modified,last_ok_at,fail_count) VALUES (?,?,?,?,?)
+     ON CONFLICT(url) DO UPDATE SET
+       etag=COALESCE(excluded.etag, rss_state.etag),
+       last_modified=COALESCE(excluded.last_modified, rss_state.last_modified),
+       last_ok_at=COALESCE(excluded.last_ok_at, rss_state.last_ok_at),
+       fail_count=excluded.fail_count`
+  ).run(url, etag ?? null, lastModified ?? null, ok ? now() : null, failCount);
+  return failCount;
+}
+
+// ─── 清理 ────────────────────────────────────────────────────────────────────
+
+export function cleanup() {
+  const seenBefore = new Date(Date.now() - config.seenRetentionDays * 86400_000).toISOString();
+  const notifBefore = new Date(Date.now() - config.notifRetentionDays * 86400_000).toISOString();
+  const usageBefore = new Date(Date.now() - config.usageRetentionDays * 86400_000)
+    .toISOString()
+    .slice(0, 10);
+  let removed = 0;
+  db.exec("BEGIN");
+  try {
+    removed += prep("DELETE FROM seen_posts WHERE seen_at < ?").run(seenBefore).changes;
+    removed += prep("DELETE FROM notifications WHERE sent_at < ?").run(notifBefore).changes;
+    removed += prep("DELETE FROM usage_daily WHERE day < ?").run(usageBefore).changes;
+    removed += prep("DELETE FROM audit_log WHERE created_at < ?").run(notifBefore).changes;
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+  return removed;
+}
+
+export function closeDb() {
+  try {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch {
+    /* 忽略 */
+  }
+  db.close();
+}
+
+log.debug("db", `SQLite 就绪: ${config.dbPath}`);

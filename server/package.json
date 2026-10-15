@@ -1,0 +1,20 @@
+{
+  "name": "nodeseek-monitor-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NodeSeek 关键词监控 Bot — 原生 Node.js 多用户服务端（Docker 部署）",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node --check src/index.js",
+    "test": "node --test test/*.test.js",
+    "test:watch": "node --test --watch test/*.test.js"
+  },
+  "dependencies": {},
+  "optionalDependencies": {}
+}

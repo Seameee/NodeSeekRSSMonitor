@@ -1,0 +1,63 @@
+# ============================================================================
+# NodeSeek 关键词监控 Bot — Docker Compose 部署
+#
+#   1. cp .env.example .env
+#   2. 编辑 .env（至少填 TELEGRAM_BOT_TOKEN、ADMIN_TELEGRAM_IDS、APP_MASTER_KEY）
+#   3. docker compose up -d
+#   4. docker compose logs -f
+# ============================================================================
+
+services:
+  nodeseek-monitor:
+    # 用官方镜像（由 GitHub Actions 构建），也可以改成 build: .
+    image: ghcr.io/seameee/nodeseek-monitor:latest
+    # 想自己构建就注释掉上面那行，改用下面两行
+    # build:
+    #   context: .
+    container_name: nodeseek-monitor
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      # SQLite 数据库与 WAL 文件都在这里，务必持久化
+      - ./data:/data
+
+    # 只用于容器内健康检查与调试，不映射到宿主机
+    # 需要从宿主机查看状态时再打开下面两行
+    # ports:
+    #   - "127.0.0.1:8787:8787"
+
+    # ── 安全加固 ──────────────────────────────────────────────────────────
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # 只读根文件系统；需要写的地方显式挂出来
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    # ── 资源限制 ──────────────────────────────────────────────────────────
+    # 单核 + 512MB 足以支撑数百用户（瓶颈在网络 I/O，不在 CPU）
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
