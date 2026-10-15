@@ -119,7 +119,15 @@ class Pool {
   run(type, payload) {
     if (this.disabled) return null;
     return new Promise((resolve, reject) => {
-      this.queue.push({ id: ++this.seq, type, payload: { ...payload, id: this.seq }, resolve, reject });
+      // type 必须随 payload 一起发给 worker：worker 端靠 task.type 分发，
+      // 只把它记在队列项上会导致 worker 收到 undefined 并回退，线程池形同虚设。
+      this.queue.push({
+        id: ++this.seq,
+        type,
+        payload: { ...payload, id: this.seq, type },
+        resolve,
+        reject,
+      });
       this.#drain();
     });
   }
