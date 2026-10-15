@@ -73,7 +73,11 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            # latest 要在 docker 分支与 main 上都生效：现在 Docker 版主线是 docker 分支，
+              # 合并回 main 后由 main 接管，两边都开着就不必再改一次。
+              # 曾经只有 is_default_branch，而 main 已不含 server/，
+              # 导致 latest 永远停在旧版本、compose 拉不到新代码。
+              type=raw,value=latest,enable=${{ github.ref == 'refs/heads/docker' || github.ref == 'refs/heads/main' }}
 
       - name: 构建并推送
         uses: docker/build-push-action@v6
