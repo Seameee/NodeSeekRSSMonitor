@@ -1,12 +1,15 @@
 name: Build and Push Docker Image
 
 # 触发条件：
-#   · push 到 main 且改动了 server/  → 构建并推送 latest
-#   · 打 v* 标签                      → 构建并推送对应版本号
-#   · 手动触发                        → 只构建，不推送
+#   · push 到 docker 分支且改动了 server/ → 构建并推送 :docker（Docker 版开发分支）
+#   · push 到 main 且改动了 server/       → 构建并推送 latest（合并回 main 后生效）
+#   · 打 v* 标签                          → 构建并推送对应版本号
+#   · 手动触发                            → 只构建，不推送
+#
+# Docker 版在 docker 分支上开发与验证，测试通过后再 PR 合并到 main。
 on:
   push:
-    branches: [main]
+    branches: [main, docker]
     paths:
       - "server/**"
       - ".github/workflows/docker.yml"
@@ -42,7 +45,9 @@ jobs:
         run: |
           set -eux
           for f in src/*.js; do node --check "$f"; done
-          node --test test/ || echo "::warning::单元测试未全部通过或目录不存在"
+          # 必须写成 test/*.test.js：Node 24 下 `node --test test/` 会报
+          # Cannot find module .../test，之前被 || 吞掉导致 CI 从未真正跑过测试
+          node --test test/*.test.js
 
       - name: Set up QEMU（多架构构建）
         uses: docker/setup-qemu-action@v3
