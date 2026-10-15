@@ -74,41 +74,26 @@ export function buildOverflowMsg(items, total) {
 }
 
 /** 统一的帮助文本（管理员会多出一段） */
+import { USER_HELP_SECTIONS, ADMIN_HELP_ITEMS, renderItems } from "./help.js";
+
+/**
+ * /help 文本。内容全部来自 help.js 的命令清单——此前这里手写了一份，
+ * 与实际实现逐渐脱节（例如 /ai set 的 [model] 参数早已去掉、管理员那节
+ * 漏了 find 与 multiuser）。现在只渲染，不再自带一份列表。
+ */
 export function buildHelp(isAdmin) {
-  let s =
-    "<b>NodeSeek 关键词监控</b>\n\n" +
-    "<b>开始使用</b>\n" +
-    "· /bind — 开通账号（独立关键词与 AI 配置）\n" +
-    "· /status — 查看我的状态与配额\n\n" +
-    "<b>关键词</b>\n" +
-    "· /add &lt;关键词&gt; [版块] [--regex] — 添加\n" +
-    "· /remove &lt;序号|关键词&gt; — 删除\n" +
-    "· /pause &lt;序号|关键词&gt; / /resume &lt;序号|关键词&gt; — 暂停/恢复\n" +
-    "· /list — 查看列表\n" +
-    "· /categories — 可用版块\n\n" +
-    "<b>AI 摘要（可选）</b>\n" +
-    "· /ai set &lt;key&gt; [model] [base_url] — 配置\n" +
-    "· /ai fallback &lt;模型1,模型2&gt; — 备用模型\n" +
-    "· /ai test — 连通性测试\n" +
-    "· /ai status — 当前配置\n" +
-    "· /ai off / /ai on — 关闭/启用\n" +
-    "· /ai clear — 清除配置（含已加密的 Key）\n\n" +
-    "<b>其他</b>\n" +
-    "· /history [数量] — 推送记录\n" +
-    "· /help — 本帮助";
+  let s = "<b>NodeSeek 关键词监控</b>";
+  for (const sec of USER_HELP_SECTIONS) {
+    s += `
+
+<b>${sec.title}</b>
+${renderItems(sec.items)}`;
+  }
   if (isAdmin) {
-    s +=
-      "\n\n<b>管理员</b>\n" +
-      "· /admin — 管理面板\n" +
-      "· /admin users [页码] — 用户列表\n" +
-      "· /admin info &lt;id&gt; — 用户详情\n" +
-      "· /admin ban &lt;id&gt; / /admin unban &lt;id&gt;\n" +
-      "· /admin quota &lt;id&gt; &lt;kw|ai|push&gt; &lt;数值&gt;\n" +
-      "· /admin note &lt;id&gt; &lt;备注&gt;\n" +
-      "· /admin del &lt;id&gt; — 删除用户及其全部数据\n" +
-      "· /admin stats — 全局统计\n" +
-      "· /admin open on|off — 开关注册\n" +
-      "· /admin audit — 操作审计";
+    s += `
+
+<b>管理员</b>
+${renderItems(ADMIN_HELP_ITEMS)}`;
   }
   return s;
 }

@@ -8,6 +8,7 @@
 // ============================================================================
 import http from "node:http";
 import { config } from "./config.js";
+import { BOT_MENU } from "./help.js";
 import { log } from "./logger.js";
 import { masterKeyFingerprint } from "./crypto.js";
 import { cleanup, closeDb, countUsers, getSetting, setSetting } from "./db.js";
@@ -108,16 +109,7 @@ async function startBot() {
   const del = await deleteWebhook();
   if (!del.ok) log.warn("bot", `deleteWebhook 失败: ${del.description}`);
 
-  await setMyCommands([
-    { command: "bind", description: "开通账号" },
-    { command: "add", description: "添加关键词" },
-    { command: "list", description: "查看关键词" },
-    { command: "remove", description: "删除关键词" },
-    { command: "ai", description: "配置 AI 摘要" },
-    { command: "status", description: "我的状态" },
-    { command: "history", description: "推送记录" },
-    { command: "help", description: "帮助" },
-  ]);
+  await setMyCommands(BOT_MENU.map(([command, description]) => ({ command, description })));
 
   let offset = 0;
   let backoff = 1000;

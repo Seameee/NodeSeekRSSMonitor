@@ -40,22 +40,18 @@ function fmtUser(u, idx) {
   return `${idx}. <code>${u.telegram_id}</code> ${role}${st} <i>${escapeHtml(String(name).slice(0, 24))}</i>`;
 }
 
+import { ADMIN_HELP_ITEMS, renderItems } from "./help.js";
+
+/**
+ * 管理员面板。与 /help 的管理员那节共用 help.js 的同一份清单，
+ * 避免两处各写一份、互相缺失。
+ */
 async function adminHelp(chatId) {
   return reply(
     chatId,
     "<b>管理员面板</b>\n\n" +
-      "· <code>/admin users [页码]</code> — 用户列表\n" +
-      "· <code>/admin find &lt;关键词&gt;</code> — 按 ID/用户名搜索\n" +
-      "· <code>/admin info &lt;id&gt;</code> — 用户详情\n" +
-      "· <code>/admin ban &lt;id&gt;</code> / <code>/admin unban &lt;id&gt;</code>\n" +
-      "· <code>/admin quota &lt;id&gt; kw|ai|push &lt;数值|-1&gt;</code> — 设置配额（-1 恢复默认）\n" +
-      "· <code>/admin note &lt;id&gt; &lt;备注&gt;</code>\n" +
-      "· <code>/admin del &lt;id&gt;</code> — 删除用户及其<b>全部数据</b>\n" +
-      "· <code>/admin stats</code> — 全局统计\n" +
-      "· <code>/admin multiuser on|off|default</code> — 多用户模式开关\n" +
-      "· <code>/admin open on|off</code> — 开关注册（仅多用户模式生效）\n" +
-      "· <code>/admin audit</code> — 最近管理操作\n\n" +
-      "<i>所有管理操作都会记录到审计表。</i>"
+      renderItems(ADMIN_HELP_ITEMS) +
+      "\n\n<i>所有管理操作都会记录到审计表。</i>"
   );
 }
 
