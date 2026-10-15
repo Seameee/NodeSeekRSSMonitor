@@ -48,7 +48,7 @@ function addUsage() {
     "用法：<code>/add &lt;关键词&gt; [版块] [--regex]</code>\n\n" +
     "· <code>/add 绿云</code> — 监控全部版块\n" +
     "· <code>/add 搬瓦工 trade</code> — 只看交易版\n" +
-    "· <code>/add 搬瓦工 trade,info</code> — 多个版块用逗号分隔\n" +
+    "· <code>/add 搬瓦工 trade,info</code> — 多个版块，会拆成两条记录（各占一条配额）\n" +
     "· <code>/add 补货.*CN2 --regex</code> — 关键词按正则解释\n\n" +
     `版块代码：${cats}\n` +
     "不带版块 = 全部版块；用 /categories 看每个版块的说明。"
@@ -65,15 +65,19 @@ function parseAddArgs(rest) {
   }
   if (!kept.length) return { error: "缺少关键词", usage: true };
   const keyword = kept[0];
-  // 第二段可以是版块（可逗号分隔）；带版块的规则只在主源生效
-  const category = kept[1] ? kept[1].split(",").map((s) => s.trim()).filter(Boolean).join(",") : null;
-  if (category) {
-    const unknown = category.split(",").filter((c) => !CATEGORIES[c]);
+  // 第二段是版块，支持逗号分隔的多个；带版块的规则只在主源生效。
+  // 返回**数组**而不是拼接字符串：调用方会为每个版块各存一条记录，
+  // 与 Worker 版行为一致（每条只认一个版块，所以 === 比较也能成立）。
+  const categories = kept[1]
+    ? kept[1].split(",").map((s) => s.trim()).filter(Boolean)
+    : null;
+  if (categories && categories.length) {
+    const unknown = categories.filter((c) => !CATEGORIES[c]);
     if (unknown.length) {
       return { error: `未知版块：${unknown.join(", ")}（用 /categories 查看）` };
     }
   }
-  return { keyword, category, matchMode };
+  return { keyword, categories, matchMode };
 }
 
 async function cmdAdd(ctx, rest) {
@@ -87,21 +91,40 @@ async function cmdAdd(ctx, rest) {
   const v = parsed.matchMode === "regex" ? validateRegex(parsed.keyword) : validateKeyword(parsed.keyword);
   if (!v.ok) return reply(chatId, `${no} ${v.reason}`);
 
+  // 多版块拆成多条单版块记录（与 Worker 版一致）：每条只认一个版块，
+  // 因此每个版块各占一个关键词配额。
+  const cats = parsed.categories && parsed.categories.length ? parsed.categories : [null];
+
   const q = effectiveQuota(user);
   const n = countKeywords(user.telegram_id);
-  if (n >= q.maxKeywords) {
-    return reply(chatId, `${no} 关键词数量已达上限（${n}/${formatQuota(q.maxKeywords)}），请先 /remove 一些`);
+  if (n + cats.length > q.maxKeywords) {
+    return reply(
+      chatId,
+      `${no} 关键词数量不足：已有 ${n}/${formatQuota(q.maxKeywords)} 条，` +
+        `本次要新建 ${cats.length} 条（每个版块一条），请先 <code>/remove</code> 一些`
+    );
   }
 
-  const r = addKeyword(user.telegram_id, parsed.keyword.trim(), parsed.category, parsed.matchMode);
-  if (r.duplicate) return reply(chatId, `${no} 该关键词（同版块）已存在`);
+  const created = [];
+  for (const cat of cats) {
+    const r = addKeyword(user.telegram_id, parsed.keyword.trim(), cat, parsed.matchMode);
+    if (!r.duplicate) created.push({ id: r.id, category: cat });
+  }
+  if (!created.length) return reply(chatId, `${no} 该关键词（同版块）已存在`);
   bumpKeywordRevision(user.telegram_id);
 
   const mode = parsed.matchMode === "regex" ? "正则" : "子串";
-  const scope = parsed.category ? `版块 ${parsed.category}` : "全部版块";
+  const scope = created[0].category
+    ? `版块 ${created.map((c) => c.category).join(", ")}`
+    : "全部版块";
+  const skipped = cats.length - created.length;
+  const dupNote = skipped > 0 ? `\n（${skipped} 个版块已存在，跳过）` : "";
   return reply(
     chatId,
-    `${ok} 已添加 #${r.id}\n<code>${escapeHtml(parsed.keyword)}</code>\n匹配方式：${mode} · ${scope}\n\n当前 ${n + 1}/${formatQuota(q.maxKeywords)} 条`
+    `${ok} 已添加 ${created.map((c) => `#${c.id}`).join(" ")}\n` +
+      `<code>${escapeHtml(parsed.keyword)}</code>\n` +
+      `匹配方式：${mode} · ${scope}${dupNote}\n\n` +
+      `当前 ${n + created.length}/${formatQuota(q.maxKeywords)} 条`
   );
 }
 

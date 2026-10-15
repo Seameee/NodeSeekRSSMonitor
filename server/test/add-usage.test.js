@@ -88,3 +88,81 @@ test("/bind 成功后的提示包含版块信息", async () => {
   await router.handleUpdate(makeUpdate("/bind", { id: newcomer, username: "nb" }));
   assert.match(sent.at(-1).html, /add 关键词 \[版块\]/, "应写出完整的 /add 形式");
 });
+
+// ─── 多版块拆分（与 Worker 版行为一致）────────────────────────────────────────
+
+const S = 5100;
+
+function freshSplitUser() {
+  db.deleteUser(S);
+  return db.createUser({ telegramId: S, username: "s", displayName: "S" });
+}
+
+test("/add：逗号分隔的多个版块拆成多条单版块记录", async () => {
+  const { sent } = installFetchMock();
+  freshSplitUser();
+  await router.handleUpdate(makeUpdate("/add 绿云 daily,tech,info --regex", { id: S }));
+
+  const rows = db.listKeywords(S);
+  assert.equal(rows.length, 3, `应插入 3 条，实际 ${rows.length}`);
+  assert.deepEqual(
+    rows.map((r) => r.category).sort(),
+    ["daily", "info", "tech"],
+    "每条只带一个版块"
+  );
+  for (const r of rows) {
+    assert.equal(r.keyword, "绿云");
+    assert.equal(r.match_mode, "regex");
+    assert.equal(r.enabled, 1);
+  }
+  assert.match(sent.at(-1).html, /已添加/, "应回执已添加");
+  assert.match(sent.at(-1).html, /当前 3\/20/, "配额应按实际条数计");
+});
+
+test("/add：单个版块只插入一条", async () => {
+  const { sent } = installFetchMock();
+  freshSplitUser();
+  await router.handleUpdate(makeUpdate("/add 搬瓦工 trade", { id: S }));
+  const rows = db.listKeywords(S);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].category, "trade");
+  assert.match(sent.at(-1).html, /当前 1\/20/);
+});
+
+test("/add：不带版块时插入一条无版块记录", async () => {
+  installFetchMock();
+  freshSplitUser();
+  await router.handleUpdate(makeUpdate("/add 补货", { id: S }));
+  const rows = db.listKeywords(S);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].category, null, "无版块应为 null（全部版块）");
+});
+
+test("/add：配额按拆分后的条数校验，不足时整批拒绝", async () => {
+  const { sent } = installFetchMock();
+  const admin = 1000; // 预置管理员，配额不限，先塞满普通用户
+  db.deleteUser(admin);
+  db.createUser({ telegramId: admin, username: "admin", role: "admin" });
+  freshSplitUser();
+  // 先占满普通用户的 20 条
+  for (let i = 0; i < 20; i++) {
+    db.addKeyword(S, `k${i}`, null, "substring");
+  }
+  db.bumpKeywordRevision(S);
+
+  await router.handleUpdate(makeUpdate("/add 新词 daily,tech", { id: S }));
+  assert.equal(db.listKeywords(S).length, 20, "超配额时不得插入任何一条");
+  assert.match(sent.at(-1).html, /关键词数量不足/, "应提示数量不足");
+});
+
+test("/add：部分版块已存在时只插入缺的那些", async () => {
+  const { sent } = installFetchMock();
+  freshSplitUser();
+  await router.handleUpdate(makeUpdate("/add 绿云 daily", { id: S }));
+  await router.handleUpdate(makeUpdate("/add 绿云 daily,tech", { id: S }));
+
+  const rows = db.listKeywords(S);
+  assert.equal(rows.length, 2, "daily 已存在只补 tech，共 2 条");
+  assert.deepEqual(rows.map((r) => r.category).sort(), ["daily", "tech"]);
+  assert.match(sent.at(-1).html, /已存在/, "应说明有跳过");
+});
