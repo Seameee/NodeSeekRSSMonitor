@@ -211,9 +211,11 @@ async function cmdCategories(ctx) {
 function aiUsageText() {
   return (
     "<b>AI 摘要配置</b>\n\n" +
-    "· <code>/ai set &lt;api_key&gt; [模型] [base_url]</code>\n" +
-    "  默认模型 <code>deepseek-chat</code>，默认地址 <code>https://api.deepseek.com/v1</code>\n" +
-    "· <code>/ai fallback &lt;模型1,模型2&gt;</code> — 主模型失败时依次回退\n" +
+    "· <code>/ai set &lt;api_key&gt; [base_url]</code> — 只配密钥与地址\n" +
+    "  例：<code>/ai set sk-xxxxxxxx https://api.deepseek.com/v1</code>\n" +
+    "  地址可省略，默认 <code>https://api.deepseek.com/v1</code>\n" +
+    "· <code>/ai fallback &lt;模型1,模型2,模型3&gt;</code> — 配置模型链，<b>第 1 个是主模型</b>，失败时依次回退\n" +
+    "  例：<code>/ai fallback deepseek-chat,deepseek-reasoner</code>\n" +
     "· <code>/ai num &lt;minLen&gt; &lt;maxPerRound&gt; &lt;maxTokens&gt; &lt;timeoutMs&gt;</code>\n" +
     "· <code>/ai prompt &lt;自定义提示词&gt;</code>\n" +
     "· <code>/ai test</code> — 连通性测试（消耗 1 次配额）\n" +
@@ -231,14 +233,22 @@ async function cmdAi(ctx, rest) {
 
   switch ((sub || "status").toLowerCase()) {
     case "set": {
-      const [apiKey, model, baseUrl] = args;
-      if (!apiKey) return reply(chatId, `${no} 用法：<code>/ai set &lt;api_key&gt; [模型] [base_url]</code>`);
+      const [apiKey, baseUrl] = args;
+      if (!apiKey) {
+        return reply(
+          chatId,
+          `${no} 用法：<code>/ai set &lt;api_key&gt; [base_url]</code>\n` +
+            `例：<code>/ai set sk-xxxxxxxx https://api.deepseek.com/v1</code>\n` +
+            `地址可省略，默认 <code>https://api.deepseek.com/v1</code>`
+        );
+      }
       if (apiKey.length < 8 || apiKey.length > 300) {
         return reply(chatId, `${no} API Key 长度不合法`);
       }
       const base = validateBaseUrl(baseUrl || existing?.base_url || "https://api.deepseek.com/v1");
       if (!base.ok) return reply(chatId, `${no} ${base.reason}`);
-      const mdl = (model || existing?.model || "deepseek-chat").slice(0, 120);
+      // 模型链统一由 /ai fallback 配置，这里只更新密钥与地址，保留已有模型
+      const mdl = (existing?.model || "deepseek-chat").slice(0, 120);
 
       upsertAiConfig(id, {
         baseUrl: base.value,
@@ -256,24 +266,39 @@ async function cmdAi(ctx, rest) {
       // 立刻回一条，且不包含 Key 本身
       await reply(
         chatId,
-        `${ok} AI 配置已保存\n\n<b>模型</b>：<code>${escapeHtml(mdl)}</code>\n` +
+        `${ok} AI 配置已保存\n\n` +
           `<b>地址</b>：<code>${escapeHtml(base.value)}</code>\n` +
-          `<b>Key</b>：<code>${escapeHtml(maskSecret(apiKey))}</code>\n\n` +
-          `用 <code>/ai test</code> 验证连通性。`
+          `<b>Key</b>：<code>${escapeHtml(maskSecret(apiKey))}</code>\n` +
+          `<b>模型</b>：<code>${escapeHtml(mdl)}</code>\n\n` +
+          `换模型用 <code>/ai fallback</code>（含主模型），<code>/ai test</code> 验证连通性。`
       );
       // Key 可能贴错，建议顺手提示删除原消息
       return;
     }
 
     case "fallback": {
-      if (!existing) return reply(chatId, `${no} 请先 /ai set 配置主模型`);
-      const list = args.join(" ").trim();
+      if (!existing) return reply(chatId, `${no} 请先 /ai set 配置 API Key 与地址`);
+      // 模型链的唯一入口：第 1 个是主模型，其余按顺序作为回退。
+      const models = args
+        .join(" ")
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!models.length) {
+        return reply(
+          chatId,
+          `${no} 用法：<code>/ai fallback &lt;模型1,模型2,模型3&gt;</code>\n` +
+            `例：<code>/ai fallback deepseek-chat,deepseek-reasoner</code>\n` +
+            `第 1 个是主模型，失败时依次回退。`
+        );
+      }
+      const [primary, ...rest] = models;
       upsertAiConfig(id, {
         baseUrl: existing.base_url,
         apiKeyEnc: existing.api_key_enc,
         apiKeyHint: existing.api_key_hint,
-        model: existing.model,
-        fallback: list.slice(0, 500) || null,
+        model: primary.slice(0, 120),
+        fallback: rest.join(",").slice(0, 500) || null,
         minLen: existing.min_len,
         maxPerRound: existing.max_per_round,
         maxTokens: existing.max_tokens,
@@ -281,7 +306,10 @@ async function cmdAi(ctx, rest) {
         prompt: existing.prompt,
         enabled: existing.enabled,
       });
-      return reply(chatId, list ? `${ok} 备用模型：<code>${escapeHtml(list)}</code>` : `${ok} 已清空备用模型`);
+      return reply(
+        chatId,
+        `${ok} 模型链：<code>${escapeHtml([primary, ...rest].join(" → "))}</code>`
+      );
     }
 
     case "num": {

@@ -112,8 +112,10 @@ export const config = {
   maxUsers: intEnv("MAX_USERS", 200, { min: 1, max: 100_000 }),
   // 新用户默认配额（管理员可对单个用户覆盖）
   defaultMaxKeywords: intEnv("DEFAULT_MAX_KEYWORDS", 20, { min: 1, max: 1_000 }),
-  defaultDailyAiQuota: intEnv("DEFAULT_DAILY_AI_QUOTA", 100, { min: 0, max: 1_000_000 }),
-  defaultDailyPushQuota: intEnv("DEFAULT_DAILY_PUSH_QUOTA", 200, { min: 0, max: 1_000_000 }),
+  // AI 配额 0 = 不限：默认不限制 AI 用量（见 db.js effectiveQuota 的 0→Infinity 映射），
+  // 管理员可用 /admin quota 给单个用户设成正数来收紧。
+  defaultDailyAiQuota: intEnv("DEFAULT_DAILY_AI_QUOTA", 0, { min: 0, max: 1_000_000 }),
+  defaultDailyPushQuota: intEnv("DEFAULT_DAILY_PUSH_QUOTA", 500, { min: 0, max: 1_000_000 }),
   // 命令限流：每用户每分钟最多多少条命令
   commandRatePerMin: intEnv("COMMAND_RATE_PER_MIN", 20, { min: 1, max: 600 }),
   // 新用户绑定后的冷却期（秒），期内不能改关键词，防止脚本刷

@@ -194,7 +194,7 @@ test("切换：普通用户无权切换模式", async () => {
 
 // ─── 管理员不受配额限制 ──────────────────────────────────────────────────────
 
-test("配额：管理员不受限，普通用户受限", async () => {
+test("配额：管理员不受限，普通用户默认 AI 不限、推送受限", async () => {
   wipeAllUsers();
   db.setMultiUserEnabled(true);
   installFetchMock();
@@ -206,9 +206,25 @@ test("配额：管理员不受限，普通用户受限", async () => {
 
   assert.equal(adminQuota.dailyAi, Infinity, "管理员 AI 配额应为不限");
   assert.equal(adminQuota.maxKeywords, Infinity, "管理员关键词数应为不限");
-  assert.equal(userQuota.dailyAi, config.defaultDailyAiQuota, "普通用户用默认配额");
+  // AI 默认配额是 0，语义为「不限」，effectiveQuota 会映射成 Infinity
+  assert.equal(config.defaultDailyAiQuota, 0, "AI 默认配额应为 0（不限）");
+  assert.equal(userQuota.dailyAi, Infinity, "普通用户默认 AI 也不限");
+  assert.equal(userQuota.dailyPush, config.defaultDailyPushQuota, "普通用户推送用默认配额");
   assert.equal(db.formatQuota(Infinity), "不限");
   assert.equal(db.formatQuota(20), "20");
+});
+
+test("配额：AI 配额设成正数即收紧，设回 0 又不限", () => {
+  wipeAllUsers();
+  const uid = 7301;
+  db.deleteUser(uid);
+  db.createUser({ telegramId: uid, username: "q" });
+
+  db.setUserQuota(uid, "daily_ai_quota", 5);
+  assert.equal(db.effectiveQuota(db.getUser(uid)).dailyAi, 5, "设为 5 应生效");
+
+  db.setUserQuota(uid, "daily_ai_quota", 0);
+  assert.equal(db.effectiveQuota(db.getUser(uid)).dailyAi, Infinity, "设回 0 表示不限");
 });
 
 test("配额：管理员 /status 显示不限", async () => {

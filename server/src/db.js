@@ -243,9 +243,12 @@ export function effectiveQuota(user) {
   if (user && (user.role === "admin" || config.adminIds.has(user.telegram_id))) {
     return { maxKeywords: Infinity, dailyAi: Infinity, dailyPush: Infinity };
   }
+  // dailyAi 为 0 表示**不限**（默认值就是 0）。要收紧就设成正数。
+  // 映射成 Infinity 后 formatQuota 会显示「不限」，配额检查也自然全部放行。
+  const dailyAi = user.daily_ai_quota ?? config.defaultDailyAiQuota;
   return {
     maxKeywords: user.max_keywords ?? config.defaultMaxKeywords,
-    dailyAi: user.daily_ai_quota ?? config.defaultDailyAiQuota,
+    dailyAi: dailyAi === 0 ? Infinity : dailyAi,
     dailyPush: user.daily_push_quota ?? config.defaultDailyPushQuota,
   };
 }
