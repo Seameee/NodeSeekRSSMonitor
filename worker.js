@@ -908,8 +908,14 @@ async function pollRSS(env) {
     const matched = kws
       .filter((k) => {
         // 备用源（source > 0）的数据忽略 category 限制，只匹配关键词
-        // 主源（source === 0）的数据正常检查 category
-        const categoryMatch = post.source > 0 || !k.category || k.category === post.category;
+        // 主源（source === 0）的数据正常检查 category。
+        //
+        // k.category 可能是**逗号分隔的多个版块**：/add 时确实是拆成多条
+        // 单版块记录的，但库里允许出现逗号拼接的值（历史数据、或从别的
+        // 实现迁移过来）。用 === 直接比会让这类值静默失效——一条都匹配
+        // 不到，而帖子照样被标记已见。这里按集合判断，两种形态都能工作。
+        const cats = k.category ? String(k.category).split(",") : null;
+        const categoryMatch = post.source > 0 || !cats || cats.includes(post.category);
         return categoryMatch && matches(post.title, k.keyword, k.match_mode);
       })
       .map((k) => k.keyword);
