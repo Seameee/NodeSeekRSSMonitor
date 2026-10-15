@@ -18,7 +18,9 @@
 
 ## 本仓库的授权范围
 
-本仓库根目录的 `LICENSE`（MIT）**仅适用于本仓库作者新增或修改的部分**，具体包括：
+本仓库根目录的 `LICENSE`（MIT）**仅适用于本仓库作者新增或修改的部分**。换言之，`LICENSE` 是对本仓库作者自身贡献的授权声明，不构成对上游原始代码的再授权。
+
+本仓库作者新增或修改的部分具体包括：
 
 - AI 摘要功能：`aiConfig`、`aiCall`、`aiSummary`、`plainText`
 - 通知构建：`buildRichNotifMsg`、`buildNotifMsg`、`sendRichMsg`
