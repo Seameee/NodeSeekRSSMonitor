@@ -2,9 +2,15 @@
 # NodeSeek 关键词监控 Bot — Docker Compose 部署
 #
 #   1. cp .env.example .env
-#   2. 编辑 .env（至少填 TELEGRAM_BOT_TOKEN、ADMIN_TELEGRAM_IDS、APP_MASTER_KEY）
+#   2. 编辑 .env（至少填 TELEGRAM_BOT_TOKEN 与 APP_MASTER_KEY）
 #   3. docker compose up -d
 #   4. docker compose logs -f
+#   5. 在 Telegram 给 Bot 发 /bind —— 第一个绑定的人就是管理员
+#
+# 运行模式由 .env 里的 MULTI_USER_ENABLED 决定：
+#   false（默认）= 单用户，只有管理员能用
+#   true        = 多用户，其他人可自助 /bind
+# 管理员可随时用 /admin multiuser on|off 在运行时切换，无需重启。
 # ============================================================================
 
 services:

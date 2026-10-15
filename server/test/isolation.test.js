@@ -16,7 +16,12 @@ const router = await import("../src/router.js");
 
 const A = 2001;
 const B = 2002;
-const ADMIN = 1000;
+const ADMIN = 1000; // 预置的管理员（由 ensureAdmin 创建）
+
+async function ensureAdmin() {
+  db.deleteUser(ADMIN);
+  db.createUser({ telegramId: ADMIN, username: "admin", role: "admin" });
+}
 
 function freshUser(id, username) {
   db.deleteUser(id);
@@ -156,27 +161,32 @@ test("权限：普通用户执行 /admin 不得进入管理面板", async () => 
   assert.match(sent[0].html, /未知命令|help/i);
 });
 
-test("权限：不在白名单的人即使库里把 role 改成 admin 也进不去", async () => {
+test("权限：普通用户无法通过任何命令把自己变成管理员", async () => {
   const { sent } = installFetchMock();
-  const faker = 4004;
-  db.deleteUser(faker);
-  db.createUser({ telegramId: faker, username: "faker", role: "admin" });
-  // 白名单里没有 4004
-  await router.handleUpdate(makeUpdate("/admin stats", { id: faker }));
-  assert.doesNotMatch(sent.at(-1).html, /全局统计/, "role 字段被篡改也不能越权");
+  const climber = 4004;
+  db.deleteUser(climber);
+  db.createUser({ telegramId: climber, username: "climber", role: "user" });
+  db.setMultiUserEnabled(true);
+
+  // 挨个试一遍可能的提权入口
+  for (const cmd of ["/admin stats", "/admin multiuser on", "/admin quota 4004 ai 999999", "/bind"]) {
+    await router.handleUpdate(makeUpdate(cmd, { id: climber }));
+  }
+  assert.equal(db.getUser(climber).role, "user", "role 不应被改动");
+  assert.equal(db.isAdminUser(db.getUser(climber)), false, "不应变成管理员");
+  assert.doesNotMatch(sent.map((m) => m.html).join(""), /全局统计/, "不应看到管理面板");
 });
 
-test("权限：管理员可以进入管理面板", async () => {
+test("权限：库内 role=admin 即可进入管理面板（首个用户认领路径）", async () => {
   const { sent } = installFetchMock();
-  db.deleteUser(ADMIN);
-  db.createUser({ telegramId: ADMIN, username: "admin", role: "admin" });
-
+  await ensureAdmin();
   await router.handleUpdate(makeUpdate("/admin stats", { id: ADMIN }));
   assert.match(sent.at(-1).html, /全局统计/);
 });
 
 test("权限：管理员不能封禁或删除其他管理员", async () => {
   const { sent } = installFetchMock();
+  await ensureAdmin();
   await router.handleUpdate(makeUpdate(`/admin ban ${ADMIN}`, { id: ADMIN }));
   assert.match(sent.at(-1).html, /不能封禁管理员/);
   assert.equal(db.getUser(ADMIN).status, "active", "管理员状态不应被改");
@@ -212,6 +222,7 @@ test("管理：配额设置与恢复默认", async () => {
   db.deleteUser(target);
   db.createUser({ telegramId: target, username: "t" });
 
+  await ensureAdmin();
   await router.handleUpdate(makeUpdate(`/admin quota ${target} ai 5`, { id: ADMIN }));
   assert.equal(db.getUser(target).daily_ai_quota, 5);
   assert.equal(db.effectiveQuota(db.getUser(target)).dailyAi, 5);
@@ -229,6 +240,7 @@ test("管理：删库级删除会清空该用户所有数据", async () => {
   db.addKeyword(victim, "词", null, "substring");
   db.markSeen(victim, [1, 2, 3]);
 
+  await ensureAdmin();
   await router.handleUpdate(makeUpdate(`/admin del ${victim}`, { id: ADMIN }));
   assert.equal(db.getUser(victim), null);
   assert.equal(db.listKeywords(victim).length, 0);
@@ -236,6 +248,8 @@ test("管理：删库级删除会清空该用户所有数据", async () => {
 });
 
 test("管理：所有管理操作都写入审计", async () => {
+  await ensureAdmin();
+  await router.handleUpdate(makeUpdate("/admin multiuser on", { id: ADMIN }));
   const rows = db.listAudit(50);
   assert.ok(rows.length > 0, "应有审计记录");
   assert.ok(

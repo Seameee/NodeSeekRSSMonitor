@@ -1,13 +1,19 @@
 // ============================================================================
 // 管理员命令
 //
-// 只有 role=admin 且 telegram_id 在 ADMIN_TELEGRAM_IDS 白名单里的用户可用。
+// 管理员身份有两个合法来源：库内 users.role='admin'（首个 /bind 用户自动获得），
+// 或环境变量 ADMIN_TELEGRAM_IDS 白名单（部署时预指定，也可用于找回管理权）。
 // 每次调用都会写审计日志。用户命令里没有任何管理员能力，反之亦然。
 // ============================================================================
 import { config } from "./config.js";
 import {
   audit,
   countKeywords,
+  isAdminUser,
+  isMultiUserEnabled,
+  isMultiUserOverridden,
+  resetMultiUserEnabled,
+  setMultiUserEnabled,
   countUsers,
   deleteUser,
   effectiveQuota,
@@ -46,7 +52,8 @@ async function adminHelp(chatId) {
       "· <code>/admin note &lt;id&gt; &lt;备注&gt;</code>\n" +
       "· <code>/admin del &lt;id&gt;</code> — 删除用户及其<b>全部数据</b>\n" +
       "· <code>/admin stats</code> — 全局统计\n" +
-      "· <code>/admin open on|off</code> — 开关注册\n" +
+      "· <code>/admin multiuser on|off|default</code> — 多用户模式开关\n" +
+      "· <code>/admin open on|off</code> — 开关注册（仅多用户模式生效）\n" +
       "· <code>/admin audit</code> — 最近管理操作\n\n" +
       "<i>所有管理操作都会记录到审计表。</i>"
   );
@@ -83,7 +90,8 @@ export async function handleAdminCommand(ctx, rest) {
           `· 状态：${Object.entries(byStatus).map(([k, v]) => `${k} ${v}`).join(" · ") || "-"}\n` +
           `· 角色：${Object.entries(byRole).map(([k, v]) => `${k} ${v}`).join(" · ") || "-"}\n` +
           `<b>今日</b>：推送 ${today.pushes} 条 · AI ${today.aiCalls} 次\n` +
-          `<b>注册开关</b>：${config.registrationOpen ? "开放" : "关闭"}\n` +
+          `<b>运行模式</b>：${isMultiUserEnabled() ? "多用户" : "单用户"}${isMultiUserOverridden() ? "（管理员覆盖）" : "（环境变量）"}\n` +
+          `<b>注册开关</b>：${config.registrationOpen ? "开放" : "关闭"}${isMultiUserEnabled() ? "" : "（单用户模式下不生效）"}\n` +
           `<b>限流表</b>：活跃用户桶 ${rl.users} 个\n` +
           `<b>worker 池</b>：${ps.disabled ? "已禁用" : `${ps.alive}/${ps.size} 存活 · 空闲 ${ps.idle} · 排队 ${ps.queued}`}`,
         `stats total=${total}`
@@ -144,7 +152,7 @@ export async function handleAdminCommand(ctx, rest) {
       const id = Number.parseInt(args[0], 10);
       const u = getUser(id);
       if (!u) return reply(chatId, "未找到该用户。");
-      if (config.adminIds.has(id)) return reply(chatId, "⚠️ 不能封禁管理员账号。");
+      if (isAdminUser(u)) return reply(chatId, "⚠️ 不能封禁管理员账号。");
       const status = action === "ban" ? "banned" : "active";
       setUserStatus(id, status);
       return done(
@@ -188,9 +196,54 @@ export async function handleAdminCommand(ctx, rest) {
       const id = Number.parseInt(args[0], 10);
       const u = getUser(id);
       if (!u) return reply(chatId, "未找到该用户。");
-      if (config.adminIds.has(id)) return reply(chatId, "⚠️ 不能删除管理员账号。");
+      if (isAdminUser(u)) return reply(chatId, "⚠️ 不能删除管理员账号。");
       deleteUser(id);
       return done(`🗑 已删除用户 <code>${id}</code> 及其全部数据`, `del ${id}`);
+    }
+
+    case "multiuser": {
+      const v = String(args[0] || "").toLowerCase();
+      const modeDesc = () =>
+        isMultiUserEnabled()
+          ? `多用户（${isMultiUserOverridden() ? "管理员已覆盖" : "继承环境变量"}）`
+          : `单用户（${isMultiUserOverridden() ? "管理员已覆盖" : "继承环境变量"}）`;
+
+      if (v === "on") {
+        setMultiUserEnabled(true);
+        return done(
+          `✅ 已切换为 <b>多用户模式</b>\n\n其他人现在可以 /bind 自助开通。\n` +
+            `新用户默认配额：关键词 ${config.defaultMaxKeywords} 条 · 每日 AI ${config.defaultDailyAiQuota} 次 · 每日推送 ${config.defaultDailyPushQuota} 条\n` +
+            `用 <code>/admin quota &lt;id&gt; …</code> 可对单个用户放宽。`,
+          "multiuser on"
+        );
+      }
+      if (v === "off") {
+        setMultiUserEnabled(false);
+        return done(
+          `🔒 已切换为 <b>单用户模式</b>\n\n` +
+            `· 只有管理员能使用本 Bot\n` +
+            `· 其他用户的命令会被拒绝，但<b>数据保留</b>\n` +
+            `· 本轮起不再向他们推送\n` +
+            `· /bind 对新用户关闭\n\n` +
+            `<i>重新开启后他们会立即恢复。</i>`,
+          "multiuser off"
+        );
+      }
+      if (v === "default" || v === "reset") {
+        resetMultiUserEnabled();
+        return done(
+          `↩️ 已清除管理员覆盖，回到环境变量 <code>MULTI_USER_ENABLED</code> 决定的值：<b>${modeDesc()}</b>`,
+          "multiuser reset"
+        );
+      }
+      return reply(
+        chatId,
+        `<b>多用户模式</b>\n\n当前：<b>${modeDesc()}</b>\n\n` +
+          `· <code>/admin multiuser on</code> — 开放给其他人使用\n` +
+          `· <code>/admin multiuser off</code> — 收回，仅管理员可用\n` +
+          `· <code>/admin multiuser default</code> — 清除覆盖，回到部署时的环境变量设置\n\n` +
+          `<i>关闭不会删除任何数据。环境变量只在从未被覆盖时生效。</i>`
+      );
     }
 
     case "open": {
@@ -198,7 +251,11 @@ export async function handleAdminCommand(ctx, rest) {
       if (!["on", "off"].includes(v)) return reply(chatId, "用法：<code>/admin open on|off</code>");
       // 运行期开关存内存；如需持久可写入 settings 表
       config.registrationOpen = v === "on";
-      return done(`✅ 注册已${v === "on" ? "开放" : "关闭"}`, `open ${v}`);
+      return done(
+        `✅ 注册已${v === "on" ? "开放" : "关闭"}` +
+          (isMultiUserEnabled() ? "" : "\n\n<i>注意：当前是单用户模式，注册开关暂时不生效。</i>"),
+        `open ${v}`
+      );
     }
 
     case "audit": {

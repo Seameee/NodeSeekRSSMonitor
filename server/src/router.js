@@ -9,7 +9,16 @@
 //   5. 未注册用户只放行 /bind /start /help
 // ============================================================================
 import { config } from "./config.js";
-import { bumpKeywordRevision, createUser, getUser, touchUser } from "./db.js";
+import {
+  bumpKeywordRevision,
+  claimOwnership,
+  createUser,
+  getUser,
+  hasAnyUser,
+  isAdminUser,
+  isMultiUserEnabled,
+  touchUser,
+} from "./db.js";
 import { checkBindCooldown, checkUsable, countCommand, markBind, takeCommandToken } from "./quota.js";
 import { sendMessage } from "./telegram.js";
 import { buildHelp } from "./notify.js";
@@ -20,8 +29,13 @@ import { log } from "./logger.js";
 /** 未注册用户即可使用的命令 */
 const PUBLIC_COMMANDS = new Set(["/start", "/help", "/bind"]);
 
-const isAdmin = (telegramId) => config.adminIds.has(telegramId);
-
+/**
+ * 注册流程。三条分支：
+ *   1. 系统还没有任何用户 → 本次 /bind 认领所有权，该用户成为管理员
+ *      （单用户与多用户模式都是这个规则，保证部署后能立刻拿到管理权）
+ *   2. 多用户模式开启 → 正常注册为普通用户（受 REGISTRATION_OPEN 与人数上限约束）
+ *   3. 多用户模式关闭 → 拒绝，只有管理员能用
+ */
 async function doBind(chatId, from) {
   const id = from.id;
 
@@ -36,17 +50,58 @@ async function doBind(chatId, from) {
       return reply(chatId, "🚫 你的账号已被封禁，如有疑问请联系管理员。");
     }
     markBind(id);
+    const role = isAdminUser(existing) ? "管理员" : "普通用户";
     return reply(
       chatId,
-      `你已经注册过了。\n\n<b>ID</b>：<code>${id}</code>\n用 /add 添加关键词即可开始接收推送。`
+      `你已经注册过了。\n\n<b>ID</b>：<code>${id}</code>（${role}）\n` +
+        `用 /add 添加关键词即可开始接收推送。`
     );
   }
 
+  // ── 分支 1：首个用户认领所有权 ──────────────────────────────────────────
+  // 无需检查多用户开关：部署后第一个人必须是管理员，否则没人能管理这个实例
+  if (!hasAnyUser()) {
+    const claimed = claimOwnership({
+      telegramId: id,
+      username: from.username,
+      displayName: [from.first_name, from.last_name].filter(Boolean).join(" "),
+    });
+    if (!claimed) {
+      // 极少见：并发认领失败，回到下面的常规分支重新判断
+      return doBind(chatId, from);
+    }
+    markBind(id);
+    log.info("bind", `首用户 ${id} (${from.username || "-"}) 已认领所有权，成为管理员`);
+    return reply(
+      chatId,
+      `🎉 <b>欢迎，你已成为本实例的管理员</b>\n\n` +
+        `<b>你的 ID</b>：<code>${id}</code>\n\n` +
+        `<b>当前模式</b>：${isMultiUserEnabled() ? "多用户" : "单用户（默认）"}\n` +
+        (isMultiUserEnabled()
+          ? "其他人可以 /bind 自助开通。\n"
+          : "只有你能使用本 Bot。需要开放给他人时，发 <code>/admin multiuser on</code>。\n") +
+        `\n<b>接下来</b>\n` +
+        `1. <code>/add 关键词</code> — 添加监控关键词（不添加就不会收到任何推送）\n` +
+        `2. <code>/ai set &lt;key&gt;</code> — 可选，配置后通知会带 AI 摘要\n` +
+        `3. <code>/admin</code> — 管理面板\n\n` +
+        `<i>建议现在就把本 Bot 设为私密，避免陌生人在你之前完成认领。</i>`
+    );
+  }
+
+  // ── 分支 3：单用户模式下拒绝新用户 ──────────────────────────────────────
+  if (!isMultiUserEnabled()) {
+    return reply(
+      chatId,
+      "🚪 <b>本实例当前为单用户模式</b>\n\n只有管理员可以使用。\n" +
+        "如需开通，请联系实例管理员。"
+    );
+  }
+
+  // ── 分支 2：多用户模式下的常规注册 ──────────────────────────────────────
   if (!config.registrationOpen) {
     return reply(chatId, "🚪 当前未开放注册，请联系管理员开通。");
   }
 
-  // 用户数上限：防止被批量注册撑爆
   const { countUsers } = await import("./db.js");
   if (countUsers() >= config.maxUsers) {
     return reply(chatId, `🚪 用户数已达上限（${config.maxUsers}），请联系管理员。`);
@@ -56,7 +111,7 @@ async function doBind(chatId, from) {
     telegramId: id,
     username: from.username,
     displayName: [from.first_name, from.last_name].filter(Boolean).join(" "),
-    role: isAdmin(id) ? "admin" : "user",
+    role: config.adminIds.has(id) ? "admin" : "user",
   });
   if (!created) return reply(chatId, "注册失败，请稍后再试。");
   markBind(id);
@@ -122,7 +177,7 @@ export async function handleUpdate(update) {
 
   // ── 管理员 ─────────────────────────────────────────────────────────────
   if (cmd === "/admin") {
-    if (!isAdmin(from.id) || registered?.role !== "admin") {
+    if (!isAdminUser(registered)) {
       // 不回显「无权限」，避免探测
       await reply(chatId, "未知命令。发送 /help 查看可用命令。");
       return true;
@@ -135,11 +190,21 @@ export async function handleUpdate(update) {
   // ── 未注册用户 ──────────────────────────────────────────────────────────
   if (!registered) {
     if (PUBLIC_COMMANDS.has(cmd)) {
+      // 单用户模式下不再劝人注册，直接说明现状
+      if (!isMultiUserEnabled() && hasAnyUser()) {
+        await reply(
+          chatId,
+          "🔒 本实例为 <b>单用户模式</b>，仅供管理员使用。\n\n" +
+            "如果你是实例管理员，请检查是否用错了 Telegram 账号。"
+        );
+        return true;
+      }
       await reply(
         chatId,
         "👋 本机器人提供 <b>NodeSeek 关键词监控</b>。\n\n" +
-          "每个用户拥有独立的关键词与 AI 配置，互不干扰。\n\n" +
-          "发送 /bind 立即开通（免费，可随时停用）。"
+          (isMultiUserEnabled()
+            ? "每个用户拥有独立的关键词与 AI 配置，互不干扰。\n\n发送 /bind 立即开通。"
+            : "发送 /bind 开始初始化（第一个绑定者将成为管理员）。")
       );
       return true;
     }
@@ -154,6 +219,18 @@ export async function handleUpdate(update) {
     } else {
       await reply(chatId, `账号状态异常（${usable.reason}），请联系管理员。`);
     }
+    return true;
+  }
+
+  // ── 单用户模式：只有管理员能继续 ────────────────────────────────────────
+  // 放在这里而不是更早，是为了让被封禁/未注册的提示保持原有语义，
+  // 同时保证已注册的普通用户在模式切换后立即被挡住，但数据不丢。
+  if (!isMultiUserEnabled() && !isAdminUser(registered)) {
+    await reply(
+      chatId,
+      "🔒 <b>本实例已切换为单用户模式</b>\n\n" +
+        "你的关键词与配置都还保留着，待管理员重新开启多用户模式后即可继续使用。"
+    );
     return true;
   }
 

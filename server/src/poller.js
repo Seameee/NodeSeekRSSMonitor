@@ -30,6 +30,8 @@ import {
   filterUnseen,
   getUsage,
   incrUsage,
+  isAdminUser,
+  isMultiUserEnabled,
 } from "./db.js";
 import { resolveAiConfig, aiSummary, plainText } from "./ai.js";
 import { matchPostsAsync } from "./worker-pool.js";
@@ -99,9 +101,13 @@ export async function runRound() {
   const postById = new Map(posts.map((p) => [p.post_id, p]));
   stats.lastPostCount = posts.length;
 
-  // ── 2. 取出所有活跃用户 ────────────────────────────────────────────────
-  // 只处理 active 且有关键词的用户；管理员同样按普通用户处理
-  const users = listUsers({ limit: 100_000, status: "active" }).filter((u) => u.telegram_id);
+  // ── 2. 取出本轮要服务的用户 ────────────────────────────────────────────
+  // 单用户模式下只服务管理员：其他人的数据保留，但不再收到推送。
+  // 这个过滤必须放在轮询里，否则关掉多用户模式后推送照旧。
+  const multiUser = isMultiUserEnabled();
+  const users = listUsers({ limit: 100_000, status: "active" })
+    .filter((u) => u.telegram_id)
+    .filter((u) => multiUser || isAdminUser(u));
   stats.lastUserCount = users.length;
   if (!users.length) {
     stats.lastRunAt = new Date().toISOString();

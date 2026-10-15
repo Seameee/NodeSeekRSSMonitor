@@ -41,16 +41,14 @@ if (!TELEGRAM_BOT_TOKEN) {
   throw new Error("缺少必填环境变量 TELEGRAM_BOT_TOKEN");
 }
 
+// 预指定的管理员（可选）。
+// 留空时由「第一个 /bind 的用户」自动成为管理员（见 db.claimOwnership）。
+// 填了就始终有效，可用于找回管理权，且不会被 /admin 命令降级。
 const ADMIN_IDS = new Set(
   listEnv("ADMIN_TELEGRAM_IDS")
     .map((s) => Number.parseInt(s, 10))
     .filter(Number.isFinite)
 );
-if (ADMIN_IDS.size === 0) {
-  throw new Error(
-    "缺少必填环境变量 ADMIN_TELEGRAM_IDS（管理员 Telegram 用户 ID，多个用逗号分隔）"
-  );
-}
 
 // ─── 主密钥：用于加密用户 API Key ────────────────────────────────────────────
 // 必须是 32 字节。支持两种写法：64 位十六进制，或任意字符串（用 SHA-256 派生）。
@@ -105,6 +103,11 @@ export const config = {
   maxPerUserPerRound: intEnv("MAX_PER_USER_PER_ROUND", 10, { min: 1, max: 100 }),
 
   // ─── 多用户与防滥用 ────────────────────────────────────────────────────────
+  // 多用户模式总开关。默认关闭 = 单用户模式：只有管理员能用，/bind 只对
+  // 第一个用户开放（该用户即成为管理员）。管理员可在运行时用
+  // /admin multiuser on|off 覆盖，覆盖值持久化到数据库。
+  multiUserEnabled: boolEnv("MULTI_USER_ENABLED", false),
+  // 多用户模式开启时，是否允许新用户自助 /bind（关闭后仅管理员能开通）
   registrationOpen: boolEnv("REGISTRATION_OPEN", true),
   maxUsers: intEnv("MAX_USERS", 200, { min: 1, max: 100_000 }),
   // 新用户默认配额（管理员可对单个用户覆盖）

@@ -6,7 +6,7 @@ NodeSeek 论坛关键词监控机器人：轮询 RSS，命中关键词的新帖�
 
 | 部署方式 | 运行环境 | 用户模型 | 适合场景 |
 | --- | --- | --- | --- |
-| **Docker（推荐）** | 任意 VPS / 家庭服务器，原生 Node.js | **多用户**，每人独立关键词与 AI 配置 | 想给多人用、要数据自主、不想受平台限制 |
+| **Docker（推荐）** | 任意 VPS / 家庭服务器，原生 Node.js | 单用户**或**多用户，部署时用变量选择 | 想给多人用、要数据自主、不想受平台限制 |
 | Cloudflare Workers | Cloudflare 边缘网络 + D1 | 单用户 | 零成本、零运维、不想管服务器 |
 
 > 本项目派生自 [Roddy-D/NodeSeekRSSMonitor](https://github.com/Roddy-D/NodeSeekRSSMonitor)，署名与授权说明见文末[来源与致谢](#来源与致谢)。
@@ -94,11 +94,14 @@ cat > .env <<'EOF'
 # 从 @BotFather 获取
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 
-# 你的 Telegram 用户 ID，从 @userinfobot 获取；多个用英文逗号分隔
-ADMIN_TELEGRAM_IDS=123456789
-
 # 主密钥：加密用户 API Key 用，务必先备份
 APP_MASTER_KEY=replace_me_with_openssl_rand_hex_32
+
+# 运行模式：false = 单用户（默认），true = 多用户
+MULTI_USER_ENABLED=false
+
+# 可选。留空时，第一个 /bind 的人自动成为管理员
+ADMIN_TELEGRAM_IDS=
 EOF
 chmod 600 .env
 ```
@@ -150,15 +153,48 @@ docker compose logs -f
 
 看到 `健康检查监听 :8787/healthz` 与第一轮轮询日志即为正常。
 
-**5. 开始使用**
+**5. 认领管理员并开始使用**
 
-在 Telegram 里给 Bot 发 `/bind` 开通账号，然后：
+在 Telegram 里给 Bot 发 `/bind`。**第一个绑定的人自动成为管理员**，然后：
 
 ```
 /add 绿云              # 添加关键词
 /list                  # 查看
 /ai set sk-xxx         # 可选，配置 AI 摘要
+/admin                 # 管理面板（仅管理员）
 ```
+
+> 留空 `ADMIN_TELEGRAM_IDS` 部署时，请尽快自己先 `/bind` 完成认领。
+> 若担心被陌生人抢先，可以先在 `.env` 里填上自己的 ID 再启动。
+
+### 单用户模式与多用户模式
+
+由 `.env` 里的 `MULTI_USER_ENABLED` 决定，**默认单用户**：
+
+| | 单用户模式（默认） | 多用户模式 |
+| --- | --- | --- |
+| 谁能用 | 只有管理员 | 管理员 + 所有 `/bind` 的用户 |
+| `/bind` | 只对第一个用户开放（认领管理员） | 任何人都可自助开通 |
+| 配额 | 管理员不受限 | 普通用户受每日配额与关键词数限制 |
+| 关键词与 AI 配置 | 各自独立 | 各自独立 |
+
+**第一个 `/bind` 的用户永远是管理员**，两种模式下都一样 —— 这是新部署拿到管理权的唯一途径（除非你在 `.env` 里预填了 `ADMIN_TELEGRAM_IDS`）。
+
+**管理员可随时切换**，不需要重启：
+
+```
+/admin multiuser on       # 开放给其他人使用
+/admin multiuser off      # 收回，仅管理员可用
+/admin multiuser default  # 清除覆盖，回到 .env 的设置
+```
+
+切换的三条保证：
+
+- **数据不丢** —— 关闭多用户模式不会删除任何用户的关键词与 AI 配置
+- **立即生效** —— 关闭后普通用户的命令被拒绝、当轮起不再向他们推送
+- **可逆** —— 重新开启后他们立刻恢复，无需重新配置
+
+优先级：**管理员覆盖 > `.env` 的 `MULTI_USER_ENABLED`**。覆盖值存在数据库里，重启后依然有效；`/admin multiuser default` 可清除覆盖回到环境变量。
 
 ### 从源码构建镜像
 
@@ -183,8 +219,14 @@ docker compose up -d --build
 | 名称 | 说明 |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Bot Token，从 [@BotFather](https://t.me/BotFather) 获取 |
-| `ADMIN_TELEGRAM_IDS` | 管理员用户 ID，逗号分隔。**只有列在这里的人能用 `/admin`** |
 | `APP_MASTER_KEY` | 加密用户 API Key 的主密钥，`openssl rand -hex 32` 生成 |
+
+可选项，但通常要设：
+
+| 名称 | 默认 | 说明 |
+| --- | --- | --- |
+| `MULTI_USER_ENABLED` | `false` | 运行模式。`false` = 单用户（只有管理员能用）；`true` = 允许多人自助 `/bind`。管理员可用 `/admin multiuser` 在运行时覆盖 |
+| `ADMIN_TELEGRAM_IDS` | 空 | 预指定的管理员 ID，逗号分隔。**留空时第一个 `/bind` 的用户自动成为管理员**；填了则这些人始终是管理员，可用于找回管理权 |
 
 > `APP_MASTER_KEY` **一旦设定不可更改**。改了之后所有用户已保存的 API Key 都无法解密，用户需要重新 `/ai set`。请与数据库一起备份。
 
@@ -193,8 +235,8 @@ docker compose up -d --build
 | 名称 | 默认 | 说明 |
 | --- | --- | --- |
 | `POLL_INTERVAL_MS` | `60000` | 轮询间隔，最小 10000 |
-| `REGISTRATION_OPEN` | `true` | 是否允许自助 `/bind`；设为 `false` 则只有管理员能开通 |
-| `MAX_USERS` | `200` | 用户总数上限 |
+| `REGISTRATION_OPEN` | `true` | 多用户模式下是否允许自助 `/bind`；关闭后仅管理员能开通（单用户模式下不生效） |
+| `MAX_USERS` | `200` | 用户总数上限（仅多用户模式） |
 | `DEFAULT_MAX_KEYWORDS` | `20` | 新用户关键词数量上限 |
 | `DEFAULT_DAILY_AI_QUOTA` | `100` | 新用户每日 AI 调用上限 |
 | `DEFAULT_DAILY_PUSH_QUOTA` | `200` | 新用户每日推送条数上限 |
@@ -238,7 +280,8 @@ docker compose up -d --build
 | `/admin note <id> <备注>` | 打标记 |
 | `/admin del <id>` | 删除用户及其全部数据 |
 | `/admin stats` | 全局统计与运行时状态 |
-| `/admin open on\|off` | 开关注册 |
+| `/admin multiuser on\|off\|default` | 多用户模式开关（见上文「单用户模式与多用户模式」） |
+| `/admin open on\|off` | 开关注册（仅多用户模式生效） |
 | `/admin audit` | 最近管理操作 |
 
 ### 权限模型
@@ -246,16 +289,22 @@ docker compose up -d --build
 ```
 未注册用户 ──► 只放行 /start /help /bind
      │
-     ▼ /bind
+     ▼ /bind（库为空时）
+第一个用户 ──► 自动成为管理员，认领本实例
+
+     ▼ /bind（已有用户时）
 普通用户 ────► 只能操作自己的关键词与 AI 配置
      │         所有读写都带 telegram_id 条件，数据库层面无法跨用户
+     │         单用户模式下会被拒绝，但数据保留
      ▼
-管理员 ──────► 用户管理、配额、封禁、全局设置
-               必须是 ADMIN_TELEGRAM_IDS 白名单成员
-               库里的 role=admin 字段单独篡改无效
+管理员 ──────► 用户管理、配额、封禁、运行模式、全局设置
+               来源有二：
+                 ① 库内 role=admin（首个 /bind 用户自动获得）
+                 ② 环境变量 ADMIN_TELEGRAM_IDS 白名单（预指定/找回）
+               管理员不受配额限制，也不能被其他管理员封禁或删除
 ```
 
-要开关注册，把 `REGISTRATION_OPEN` 设为 `false`；此后新用户 `/bind` 会被拒绝，需要管理员手动在数据库里插入，或临时打开开关让其自助注册。
+管理员身份无法通过任何用户命令获得 —— 测试里专门覆盖了「普通用户挨个尝试提权入口」的场景。
 
 ### 安全设计
 
@@ -305,6 +354,8 @@ compose 里默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件�
 | 全局限流 | Telegram 发送速率 | 20 条/秒 |
 
 超限时的行为：命令限流会静默丢弃（只偶尔提示，避免限流本身变成放大器）；日配额用尽当天只提示一次。
+
+**管理员不受任何配额限制**，也不受关键词数量上限约束 —— 单用户模式下只有管理员一个人，设限没有意义。
 
 管理员可用 `/admin quota <id> ai 500` 给可信用户放宽。
 
@@ -388,6 +439,8 @@ docker compose exec nodeseek-monitor curl -s localhost:8787/healthz | head
 | 通知里没有 AI 摘要 | `/ai status` 看配置；日志搜 `[ai]`；确认该帖有正文（约 20% 的帖子被作者设为「仅注册用户可见」，取不到正文，会跳过摘要） |
 | 日志 `API Key 无法解密` | `APP_MASTER_KEY` 被改过。让该用户重新 `/ai set` |
 | 内存持续增长 | 检查 `WORKER_POOL_SIZE` 与 `AI_CONCURRENCY`；worker 超时会重建，正常不会泄漏 |
+| 别人 `/bind` 提示「单用户模式」 | 这是默认行为。需要开放时发 `/admin multiuser on`，或在 `.env` 里设 `MULTI_USER_ENABLED=true` 后重启 |
+| 自己不是管理员了 | 说明被别的账号抢先 `/bind` 认领了。在 `.env` 里填上 `ADMIN_TELEGRAM_IDS=你的ID` 后重启，即可拿回管理权 |
 
 ### 不用 Compose 直接跑
 

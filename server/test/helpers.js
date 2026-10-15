@@ -11,7 +11,9 @@ export const TEST_DB = join(TEST_DIR, "test.db");
 
 process.env.NODE_ENV = "test";
 process.env.TELEGRAM_BOT_TOKEN = "123456:TESTTOKEN";
-process.env.ADMIN_TELEGRAM_IDS = "1000";
+// 默认留空：这样管理员只能来自「首个 /bind 认领」，与新的部署模型一致
+process.env.ADMIN_TELEGRAM_IDS = "";
+process.env.MULTI_USER_ENABLED = "true";
 process.env.DB_PATH = TEST_DB;
 process.env.APP_MASTER_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 process.env.LOG_LEVEL = "error"; // 测试时静音

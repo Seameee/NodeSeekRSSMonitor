@@ -149,6 +149,13 @@ export function getSetting(key, def = null) {
   return row ? row.value : def;
 }
 
+/** 判断某人是否是管理员：环境变量白名单 或 库内 role=admin */
+export function isAdminUser(userOrId) {
+  const user = typeof userOrId === "object" && userOrId !== null ? userOrId : getUser(userOrId);
+  if (!user) return false;
+  return user.role === "admin" || config.adminIds.has(user.telegram_id);
+}
+
 export function setSetting(key, value) {
   prep("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(
     key,
@@ -230,13 +237,89 @@ export function deleteUser(telegramId) {
   }
 }
 
-/** 解析用户的生效配额：用户级覆盖优先，否则用全局默认 */
+/** 解析用户的生效配额：用户级覆盖优先，否则用全局默认。
+ *  管理员不受配额限制（返回 Infinity），避免自己给自己设限。 */
 export function effectiveQuota(user) {
+  if (user && (user.role === "admin" || config.adminIds.has(user.telegram_id))) {
+    return { maxKeywords: Infinity, dailyAi: Infinity, dailyPush: Infinity };
+  }
   return {
     maxKeywords: user.max_keywords ?? config.defaultMaxKeywords,
     dailyAi: user.daily_ai_quota ?? config.defaultDailyAiQuota,
     dailyPush: user.daily_push_quota ?? config.defaultDailyPushQuota,
   };
+}
+
+/** 展示用：Infinity 写成「不限」 */
+export function formatQuota(n) {
+  return n === Infinity ? "不限" : String(n);
+}
+
+// ─── 多用户模式（环境变量给初值，管理员运行时可覆盖，覆盖值持久化）──────────
+
+const MODE_KEY = "multi_user_enabled";
+
+/**
+ * 当前是否处于多用户模式。
+ * 优先级：数据库中的管理员覆盖值 > 环境变量 MULTI_USER_ENABLED。
+ */
+export function isMultiUserEnabled() {
+  const stored = getSetting(MODE_KEY, null);
+  if (stored === null) return config.multiUserEnabled;
+  return stored === "1";
+}
+
+/** 覆盖值是否由管理员设置过（而非继承环境变量） */
+export function isMultiUserOverridden() {
+  return getSetting(MODE_KEY, null) !== null;
+}
+
+export function setMultiUserEnabled(enabled) {
+  setSetting(MODE_KEY, enabled ? "1" : "0");
+}
+
+/** 清除管理员覆盖，回到环境变量决定的值 */
+export function resetMultiUserEnabled() {
+  prep("DELETE FROM settings WHERE key=?").run(MODE_KEY);
+}
+
+// ─── 所有权 / 首个管理员 ─────────────────────────────────────────────────────
+
+/**
+ * 认领所有权：系统里还没有任何用户时，把第一个 /bind 的人设为管理员。
+ * 返回 true 表示本次调用完成了认领。
+ * 用事务包住「检查 + 插入」，避免并发 /bind 产生两个管理员。
+ */
+export function claimOwnership({ telegramId, username, displayName }) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const n = prep("SELECT COUNT(*) AS n FROM users").get().n;
+    if (n > 0) {
+      db.exec("ROLLBACK");
+      return false;
+    }
+    prep(
+      `INSERT INTO users (telegram_id,username,display_name,role,status,created_at,last_seen_at)
+       VALUES (?,?,?, 'admin', 'active', ?, ?)`
+    ).run(telegramId, username || null, displayName || null, now(), now());
+    prep("INSERT INTO audit_log (actor_id,action,target_id,detail,created_at) VALUES (?,?,?,?,?)").run(
+      telegramId,
+      "claim_ownership",
+      telegramId,
+      "首个用户自动成为管理员",
+      now()
+    );
+    db.exec("COMMIT");
+    return true;
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+/** 是否已经有任何用户（用于判断系统是否已被认领） */
+export function hasAnyUser() {
+  return countUsers() > 0;
 }
 
 // ─── 关键词 ──────────────────────────────────────────────────────────────────

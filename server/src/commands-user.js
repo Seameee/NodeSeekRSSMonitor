@@ -11,6 +11,9 @@ import {
   countKeywords,
   deleteAiConfig,
   effectiveQuota,
+  formatQuota,
+  isAdminUser,
+  isMultiUserEnabled,
   getAiConfig,
   getHistory,
   getUsage,
@@ -68,7 +71,7 @@ async function cmdAdd(ctx, rest) {
   const q = effectiveQuota(user);
   const n = countKeywords(user.telegram_id);
   if (n >= q.maxKeywords) {
-    return reply(chatId, `${no} 关键词数量已达上限（${n}/${q.maxKeywords}），请先 /remove 一些`);
+    return reply(chatId, `${no} 关键词数量已达上限（${n}/${formatQuota(q.maxKeywords)}），请先 /remove 一些`);
   }
 
   const r = addKeyword(user.telegram_id, parsed.keyword.trim(), parsed.category, parsed.matchMode);
@@ -79,7 +82,7 @@ async function cmdAdd(ctx, rest) {
   const scope = parsed.category ? `版块 ${parsed.category}` : "全部版块";
   return reply(
     chatId,
-    `${ok} 已添加 #${r.id}\n<code>${escapeHtml(parsed.keyword)}</code>\n匹配方式：${mode} · ${scope}\n\n当前 ${n + 1}/${q.maxKeywords} 条`
+    `${ok} 已添加 #${r.id}\n<code>${escapeHtml(parsed.keyword)}</code>\n匹配方式：${mode} · ${scope}\n\n当前 ${n + 1}/${formatQuota(q.maxKeywords)} 条`
   );
 }
 
@@ -150,7 +153,7 @@ async function cmdList(ctx) {
   });
   return reply(
     chatId,
-    `<b>我的关键词</b>（${kws.length}/${q.maxKeywords}）\n\n${lines.join("\n")}\n\n` +
+    `<b>我的关键词</b>（${kws.length}/${formatQuota(q.maxKeywords)}）\n\n${lines.join("\n")}\n\n` +
       `<i>用 /pause、/resume、/remove 加序号或关键词操作</i>`
   );
 }
@@ -345,7 +348,7 @@ async function cmdAi(ctx, rest) {
           `<b>地址</b>：<code>${escapeHtml(existing.base_url)}</code>\n` +
           `<b>Key</b>：<code>${escapeHtml(existing.api_key_hint)}</code>\n` +
           `<b>参数</b>：正文≥${existing.min_len} · 每轮≤${existing.max_per_round} · max_tokens ${existing.max_tokens} · 超时 ${existing.timeout_ms}ms\n` +
-          `<b>今日用量</b>：${used}/${q.dailyAi}\n` +
+          `<b>今日用量</b>：${used}/${formatQuota(q.dailyAi)}\n` +
           `<b>提示词</b>：${existing.prompt ? "自定义" : "默认"}\n\n` +
           `<i>密钥无法还原为明文，忘记请直接 /ai set 覆盖。</i>`
       );
@@ -371,9 +374,11 @@ async function cmdStatus(ctx) {
     chatId,
     `<b>我的状态</b>\n\n` +
       `<b>账号</b>：<code>${user.telegram_id}</code>（${role} · ${statusText}）\n` +
-      `<b>关键词</b>：${kwCount}/${q.maxKeywords} 条\n` +
+      `<b>角色</b>：${isAdminUser(user) ? "管理员（不受配额限制）" : "普通用户"}\n` +
+      `<b>运行模式</b>：${isMultiUserEnabled() ? "多用户" : "单用户"}\n` +
+      `<b>关键词</b>：${kwCount}/${formatQuota(q.maxKeywords)} 条\n` +
       `<b>AI 摘要</b>：${ai ? (ai.enabled ? `已启用 · <code>${escapeHtml(ai.model)}</code>` : "已关闭") : "未配置"}\n` +
-      `<b>今日用量</b>：推送 ${usage.pushes}/${q.dailyPush} · AI ${usage.ai_calls}/${q.dailyAi}\n` +
+      `<b>今日用量</b>：推送 ${usage.pushes}/${formatQuota(q.dailyPush)} · AI ${usage.ai_calls}/${formatQuota(q.dailyAi)}\n` +
       `<b>注册时间</b>：${user.created_at.slice(0, 19).replace("T", " ")} UTC`
   );
 }
