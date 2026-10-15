@@ -53,14 +53,18 @@ function withChatLock(chatId, fn) {
 
 /**
  * 调用 Bot API。带指数退避重试；遇 429 会读取 retry_after 并遵守。
+ *
+ * timeoutMs 是客户端的 abort 时限。**长轮询必须传一个显著大于 Telegram 侧
+ * timeout 的值** —— 否则会在服务端返回前抢先 abort，把每次正常空闲轮询都
+ * 变成失败重试，期间用户命令全部积压（曾因此出现 30 秒以上的命令延迟）。
  */
-export async function tg(method, body, { retries = 3 } = {}) {
+export async function tg(method, body, { retries = 3, timeoutMs = 20_000 } = {}) {
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     await takeToken();
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 20_000);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       let resp;
       try {
         resp = await fetch(API(method), {
@@ -149,8 +153,28 @@ export async function sendMany(items, limit = config.sendConcurrency) {
   return results;
 }
 
-export const getUpdates = (offset, timeoutSec = 25) =>
-  tg("getUpdates", { offset, timeout: timeoutSec, allowed_updates: ["message", "callback_query"] }, { retries: 1 });
+/** Telegram 侧长轮询秒数 */
+export const POLL_TIMEOUT_SEC = 25;
+
+/**
+ * 长轮询客户端超时 = Telegram 侧 timeout + 15 秒余量。
+ * 这个余量是必须的：相等或更短会让空闲轮询永远以 abort 收场（历史 bug）。
+ */
+export const getUpdatesTimeoutMs = (timeoutSec = POLL_TIMEOUT_SEC) => (timeoutSec + 15) * 1000;
+
+/**
+ * 长轮询。
+ *
+ * 刻意不重试：长轮询"超时后返回空结果"是**成功路径**，不该被当成错误反复
+ * 重试；真出错（网络/409）时立即返回，由 index.js 的循环统一退避——那一层
+ * 才会更新 offset、也才知道什么时候该退避多久。
+ */
+export const getUpdates = (offset, timeoutSec = POLL_TIMEOUT_SEC) =>
+  tg(
+    "getUpdates",
+    { offset, timeout: timeoutSec, allowed_updates: ["message", "callback_query"] },
+    { retries: 0, timeoutMs: getUpdatesTimeoutMs(timeoutSec) }
+  );
 
 export const setMyCommands = (commands) => tg("setMyCommands", { commands });
 
