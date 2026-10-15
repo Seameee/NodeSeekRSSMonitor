@@ -1,0 +1,37 @@
+# NOTICE
+
+本仓库（NodeSeek 关键词监控 Bot）包含派生自第三方项目的代码。
+以下列出该来源及其授权状态。
+
+## 上游项目
+
+- 项目：[Roddy-D/NodeSeekRSSMonitor](https://github.com/Roddy-D/NodeSeekRSSMonitor)
+- 作者：[Roddy-D](https://github.com/Roddy-D)
+- 创建时间：2026-04-01
+- 仓库内容：`README.md` 与 `worker.js`
+
+## 授权状态说明
+
+**上游项目未附带任何开源许可证。** 该仓库根目录仅有两个文件，均无版权声明、许可声明或 SPDX 标识。
+
+按著作权法（含《伯尔尼公约》）的默认规则，**未声明许可证即视为保留所有权利**。因此上游作者 Roddy-D 对其原始代码仍持有全部权利，本项目无权对该部分代码再授权。
+
+## 本仓库的授权范围
+
+本仓库根目录的 `LICENSE`（MIT）**仅适用于本仓库作者新增或修改的部分**，具体包括：
+
+- AI 摘要功能：`aiConfig`、`aiCall`、`aiSummary`、`plainText`
+- 通知构建：`buildRichNotifMsg`、`buildNotifMsg`、`sendRichMsg`
+- Dev 模式：`getDevState`、`setDevState`、`devFromValue`
+- D1 访问优化：`getSettings`、`filterUnseen`，以及 `initDB`、`markSeen`、`cleanup` 的重写
+- `README.md` 全文，以及 `proxy-server.js`、`proxy-server-express.js`、`Dockerfile`
+
+上游原有代码（`parseRSS`、`matches`、`fetchEntries`、`tg`、`sendMsg`、`handleCommand` 及各命令处理函数、`pollRSS` 的主体框架、数据表结构）**不适用本仓库的 MIT 许可**，其权利归 Roddy-D 所有。
+
+## 如需使用上游代码
+
+若你希望在本项目之外的场景使用上游原始代码，请直接联系原作者取得授权。本项目无法代为授权。
+
+## 我们做了什么
+
+本项目在上游基础上做了大幅扩展，主要新增与改造内容见 `README.md` 的「来源与致谢」一节。
