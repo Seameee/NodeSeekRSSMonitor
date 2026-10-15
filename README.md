@@ -123,7 +123,9 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data:/data
+      # 命名卷：容器以非 root 运行，命名卷会继承镜像里 /data 的属主，
+      # 开箱可用。改用宿主机目录见下方「改用宿主机目录」。
+      - nodeseek-data:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -141,6 +143,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  nodeseek-data:
 EOF
 ```
 
@@ -394,11 +399,15 @@ compose 里默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件�
 
 ### 数据与备份
 
-所有数据都在 `./data/nodeseek.db`（外加 WAL/SHM 文件）。备份：
+数据库是容器内 `/data/nodeseek.db`（外加 WAL/SHM 文件），默认放在 Docker 命名卷 `nodeseek-data` 里。
+
+备份：
 
 ```bash
 docker compose stop
-tar czf nodeseek-backup-$(date +%F).tar.gz data/ .env
+docker run --rm -v nodeseek-data:/data -v "$PWD:/backup" alpine \
+  tar czf /backup/nodeseek-backup-$(date +%F).tar.gz -C /data .
+cp .env nodeseek-backup-$(date +%F).env
 docker compose start
 ```
 
@@ -408,9 +417,40 @@ docker compose start
 
 ```bash
 docker compose down
-tar xzf nodeseek-backup-YYYY-MM-DD.tar.gz
+docker run --rm -v nodeseek-data:/data -v "$PWD:/backup" alpine \
+  sh -c "tar xzf /backup/nodeseek-backup-YYYY-MM-DD.tar.gz -C /data"
 docker compose up -d
 ```
+
+### 改用宿主机目录
+
+想把数据库直接放在宿主机上（方便用 `sqlite3` 查看，或纳入现有备份体系），把 compose 里的
+
+```yaml
+      - nodeseek-data:/data
+```
+
+换成
+
+```yaml
+      - ./data:/data
+```
+
+并删掉文件末尾的 `volumes:` 段。
+
+**但必须先创建目录并把属主交给 uid 1000**，否则容器会以
+
+```
+Error: unable to open database file (ERR_SQLITE_ERROR, errcode 14)
+```
+
+反复崩溃重启 —— 容器以非 root 的 `node`(uid 1000) 运行，而 Docker 自动创建的宿主机目录属主是 root：
+
+```bash
+mkdir -p data && sudo chown -R 1000:1000 data
+```
+
+之后数据就在 `./data/nodeseek.db`，用 `tar czf nodeseek-backup-$(date +%F).tar.gz data/ .env` 备份即可。
 
 ### 升级
 
@@ -439,6 +479,7 @@ docker compose exec nodeseek-monitor curl -s localhost:8787/healthz | head
 | 通知里没有 AI 摘要 | `/ai status` 看配置；日志搜 `[ai]`；确认该帖有正文（约 20% 的帖子被作者设为「仅注册用户可见」，取不到正文，会跳过摘要） |
 | 日志 `API Key 无法解密` | `APP_MASTER_KEY` 被改过。让该用户重新 `/ai set` |
 | 内存持续增长 | 检查 `WORKER_POOL_SIZE` 与 `AI_CONCURRENCY`；worker 超时会重建，正常不会泄漏 |
+| 容器反复重启，日志 `unable to open database file` | 用了绑定挂载但宿主机目录属主是 root。执行 `sudo chown -R 1000:1000 data`，或改回默认的命名卷 |
 | 别人 `/bind` 提示「单用户模式」 | 这是默认行为。需要开放时发 `/admin multiuser on`，或在 `.env` 里设 `MULTI_USER_ENABLED=true` 后重启 |
 | 自己不是管理员了 | 说明被别的账号抢先 `/bind` 认领了。在 `.env` 里填上 `ADMIN_TELEGRAM_IDS=你的ID` 后重启，即可拿回管理权 |
 

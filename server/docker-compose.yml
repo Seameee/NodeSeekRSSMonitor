@@ -11,6 +11,9 @@
 #   false（默认）= 单用户，只有管理员能用
 #   true        = 多用户，其他人可自助 /bind
 # 管理员可随时用 /admin multiuser on|off 在运行时切换，无需重启。
+#
+# 数据持久化默认使用**命名卷**，无需任何手工准备即可启动。
+# 若想改用宿主机目录，见下方 volumes 段的说明（必须先处理属主）。
 # ============================================================================
 
 services:
@@ -27,8 +30,19 @@ services:
       - .env
 
     volumes:
-      # SQLite 数据库与 WAL 文件都在这里，务必持久化
-      - ./data:/data
+      # SQLite 数据库与 WAL 文件都在 /data，必须持久化。
+      #
+      # 这里默认用命名卷。原因：容器以非 root 的 node(uid 1000) 运行，
+      # 而 Docker 用**绑定挂载**自动创建宿主机目录时，目录属主是 root，
+      # 非 root 进程写不进去，会直接报
+      #   Error: unable to open database file (ERR_SQLITE_ERROR, errcode 14)
+      # 命名卷则会从镜像继承 /data 的属主（uid 1000），因此零配置可用。
+      - nodeseek-data:/data
+      #
+      # 想改成宿主机目录（便于直接备份、用 sqlite3 查看）就用下面这行替换上面，
+      # 但必须先把目录交给 uid 1000，否则容器会崩溃重启：
+      #   mkdir -p data && sudo chown -R 1000:1000 data
+      # - ./data:/data
 
     # 只用于容器内健康检查与调试，不映射到宿主机
     # 需要从宿主机查看状态时再打开下面两行
@@ -67,3 +81,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+volumes:
+  nodeseek-data:
+
