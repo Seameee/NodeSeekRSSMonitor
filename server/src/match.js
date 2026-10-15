@@ -31,7 +31,10 @@ export function validateRegex(pattern) {
     return { ok: false, reason: "正则不能为空" };
   }
   if (pattern.length > config.maxRegexLen) {
-    return { ok: false, reason: `正则过长（上限 ${config.maxRegexLen} 字符）` };
+    return {
+      ok: false,
+      reason: `正则过长（当前 ${pattern.length} 字符，上限 ${config.maxRegexLen}）`,
+    };
   }
   for (const re of REDOS_PATTERNS) {
     if (re.test(pattern)) {
@@ -54,7 +57,10 @@ export function validateKeyword(keyword) {
   const s = String(keyword || "").trim();
   if (!s) return { ok: false, reason: "关键词不能为空" };
   if (s.length > config.maxKeywordLen) {
-    return { ok: false, reason: `关键词过长（上限 ${config.maxKeywordLen} 字符）` };
+    return {
+      ok: false,
+      reason: `关键词过长（当前 ${s.length} 字符，上限 ${config.maxKeywordLen}）`,
+    };
   }
   // 控制字符会污染输出与日志
   if (/[\u0000-\u001f\u007f]/.test(s)) {

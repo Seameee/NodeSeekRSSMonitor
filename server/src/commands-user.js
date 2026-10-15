@@ -39,6 +39,22 @@ const no = "⚠️";
 
 // ─── 关键词 ──────────────────────────────────────────────────────────────────
 
+/** /add 的完整用法。缺少参数时展示 —— 只写「/add 关键词」会让用户
+ *  不知道还能指定版块和 --regex，这里把版块代码直接从 CATEGORIES 生成，
+ *  避免与可用版块列表脱节。 */
+function addUsage() {
+  const cats = Object.keys(CATEGORIES).join(" / ");
+  return (
+    "用法：<code>/add &lt;关键词&gt; [版块] [--regex]</code>\n\n" +
+    "· <code>/add 绿云</code> — 监控全部版块\n" +
+    "· <code>/add 搬瓦工 trade</code> — 只看交易版\n" +
+    "· <code>/add 搬瓦工 trade,info</code> — 多个版块用逗号分隔\n" +
+    "· <code>/add 补货.*CN2 --regex</code> — 关键词按正则解释\n\n" +
+    `版块代码：${cats}\n` +
+    "不带版块 = 全部版块；用 /categories 看每个版块的说明。"
+  );
+}
+
 function parseAddArgs(rest) {
   const tokens = rest.split(/\s+/).filter(Boolean);
   let matchMode = "substring";
@@ -47,7 +63,7 @@ function parseAddArgs(rest) {
     if (t === "--regex" || t === "-r") matchMode = "regex";
     else kept.push(t);
   }
-  if (!kept.length) return { error: "缺少关键词" };
+  if (!kept.length) return { error: "缺少关键词", usage: true };
   const keyword = kept[0];
   // 第二段可以是版块（可逗号分隔）；带版块的规则只在主源生效
   const category = kept[1] ? kept[1].split(",").map((s) => s.trim()).filter(Boolean).join(",") : null;
@@ -63,7 +79,10 @@ function parseAddArgs(rest) {
 async function cmdAdd(ctx, rest) {
   const { user, chatId } = ctx;
   const parsed = parseAddArgs(rest);
-  if (parsed.error) return reply(chatId, `${no} ${parsed.error}`);
+  if (parsed.error) {
+    const hint = parsed.usage ? `\n\n${addUsage()}` : "";
+    return reply(chatId, `${no} ${parsed.error}${hint}`);
+  }
 
   const v = parsed.matchMode === "regex" ? validateRegex(parsed.keyword) : validateKeyword(parsed.keyword);
   if (!v.ok) return reply(chatId, `${no} ${v.reason}`);
@@ -140,9 +159,7 @@ async function cmdList(ctx) {
   if (!kws.length) {
     return reply(
       chatId,
-      "暂无关键词。\n\n用 <code>/add 绿云</code> 添加，例如：\n" +
-        "· <code>/add 搬瓦工 trade</code> — 只监控交易版\n" +
-        "· <code>/add 补货.*CN2 --regex</code> — 正则匹配"
+      `暂无关键词，所以不会有任何推送。\n\n${addUsage()}`
     );
   }
   const lines = kws.map((k, i) => {

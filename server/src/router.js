@@ -81,7 +81,7 @@ async function doBind(chatId, from) {
           ? "其他人可以 /bind 自助开通。\n"
           : "只有你能使用本 Bot。需要开放给他人时，发 <code>/admin multiuser on</code>。\n") +
         `\n<b>接下来</b>\n` +
-        `1. <code>/add 关键词</code> — 添加监控关键词（不添加就不会收到任何推送）\n` +
+        `1. <code>/add 关键词 [版块]</code> — 添加监控关键词（不添加 = 收不到推送；不带版块 = 全部版块）\n` +
         `2. <code>/ai set &lt;key&gt;</code> — 可选，配置后通知会带 AI 摘要\n` +
         `3. <code>/admin</code> — 管理面板\n\n` +
         `<i>建议现在就把本 Bot 设为私密，避免陌生人在你之前完成认领。</i>`
@@ -121,7 +121,7 @@ async function doBind(chatId, from) {
     chatId,
     `✅ <b>注册成功</b>\n\n<b>你的 ID</b>：<code>${id}</code>\n\n` +
       `<b>接下来</b>\n` +
-      `1. <code>/add 关键词</code> — 添加监控关键词（不添加就不会收到任何推送）\n` +
+      `1. <code>/add 关键词 [版块]</code> — 添加监控关键词（不添加 = 收不到推送；不带版块 = 全部版块）\n` +
       `2. <code>/ai set &lt;key&gt;</code> — 可选，配置后通知会带 AI 摘要\n` +
       `3. <code>/help</code> — 查看全部命令\n\n` +
       `<i>你的关键词与 AI 配置完全独立，其他用户与管理员的配置互不可见。</i>`

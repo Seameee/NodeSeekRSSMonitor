@@ -121,7 +121,7 @@ export const config = {
 
   // 输入限制
   maxKeywordLen: intEnv("MAX_KEYWORD_LEN", 100, { min: 1, max: 500 }),
-  maxRegexLen: intEnv("MAX_REGEX_LEN", 200, { min: 1, max: 1_000 }),
+  maxRegexLen: intEnv("MAX_REGEX_LEN", 500, { min: 1, max: 2_000 }),
   maxPromptLen: intEnv("MAX_PROMPT_LEN", 1_000, { min: 10, max: 4_000 }),
   maxHistoryRows: intEnv("MAX_HISTORY_ROWS", 20, { min: 1, max: 100 }),
 
