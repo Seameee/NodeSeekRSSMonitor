@@ -59,7 +59,7 @@ export const ADMIN_HELP_ITEMS = [
   ["/admin ban &lt;id&gt; / /admin unban &lt;id&gt;", "封禁 / 解封"],
   ["/admin quota &lt;id&gt; kw|ai|push &lt;数值|-1&gt;", "设置配额（-1 恢复默认，ai 设 0 为不限）"],
   ["/admin note &lt;id&gt; &lt;备注&gt;", "写备注"],
-  ["/admin del &lt;id&gt;", "删除用户及其<b>全部数据&lt;/b&gt;"],
+  ["/admin del &lt;id&gt;", "删除用户及其<b>全部数据</b>"],
   ["/admin stats", "全局统计"],
   ["/admin multiuser on|off|default", "多用户模式开关"],
   ["/admin open on|off", "开关注册（仅多用户模式生效）"],
@@ -83,4 +83,4 @@ export const BOT_MENU = [
 
 /** 渲染成一行行「· 命令 — 说明」 */
 export const renderItems = (items) =>
-  items.map(([cmd, desc]) => `· <code>${cmd}&lt;/code&gt; — ${desc}`).join("\n");
+  items.map(([cmd, desc]) => `· <code>${cmd}</code> — ${desc}`).join("\n");

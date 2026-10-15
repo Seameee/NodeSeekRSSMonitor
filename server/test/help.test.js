@@ -52,3 +52,16 @@ test("渲染：不得出现未转义的尖括号（会 Telegram 拒发）", () =
     }
   }
 });
+
+test("渲染：每个 <code> 都必须有配对的 </code>", () => {
+  // 上面那条测试只查"有没有非法标签"，而 &lt;/code&gt; 是合法的转义文本，
+  // 所以它放过了一次真实故障：闭合标签被误转义后，Telegram 报
+  // can't parse entities: Can't find end tag corresponding to start tag "code"
+  // 并整条拒收消息，用户侧看到的就是"发命令没反应"。这里补上配对检查。
+  for (const [label, text] of [["用户", buildHelp(false)], ["管理员", buildHelp(true)]]) {
+    const open = (text.match(/<code>/g) || []).length;
+    const close = (text.match(/<\/code>/g) || []).length;
+    assert.equal(open, close, `${label}视角的 <code> 与 </code> 不配对（${open} vs ${close}）`);
+    assert.ok(open > 0, `${label}视角应至少有一个 <code>`);
+  }
+});
