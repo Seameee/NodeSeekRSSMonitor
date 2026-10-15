@@ -106,8 +106,12 @@ export function matches(title, keyword, mode = "substring") {
 export function matchPost(post, keywords) {
   const hits = [];
   for (const kw of keywords) {
-    // 备用源（source>0）忽略版块限制，主源按版块过滤
-    const categoryOk = post.source > 0 || !kw.category || kw.category === post.category;
+    // 备用源（source>0）忽略版块限制，主源按版块过滤。
+    // category 可能是**逗号分隔的多个版块**（/add kw trade,info），
+    // 必须按集合判断：用 === 直接比会让所有多版块规则永不命中——用户设了
+    // daily,tech,info,expose,trade 却一条都匹配不到，就是这个原因。
+    const cats = kw.category ? String(kw.category).split(",") : null;
+    const categoryOk = post.source > 0 || !cats || cats.includes(post.category);
     if (!categoryOk) continue;
     if (matches(post.title, kw.keyword, kw.match_mode)) hits.push(kw.keyword);
   }
