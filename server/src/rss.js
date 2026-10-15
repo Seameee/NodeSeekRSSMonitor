@@ -3,12 +3,18 @@
 //
 // 多用户下最重要的一条优化：**每轮只抓一次，所有用户复用同一份结果**。
 // 抓取属于网络 I/O，与用户数无关；用户数只影响后续的内存匹配量。
+//
+// 解析走 worker 线程池（parseRSSAsync）：虽然解析本身只需 ~0.1ms，
+// 但放到 worker 后主线程不会被异常巨大的 RSS 响应卡住，而且任务带硬超时，
+// 上游返回畸形数据时会终止并重建 worker，不影响命令响应。
 // ============================================================================
 import { RSS_SOURCES, config } from "./config.js";
 import { getRssState, setRssState } from "./db.js";
 import { log } from "./logger.js";
 import { parseRSS } from "./rss-parse.js";
+import { parseRSSAsync } from "./worker-pool.js";
 
+// 保留同步版导出，便于测试与离线比对
 export { parseRSS };
 
 const FETCH_HEADERS = {
@@ -45,7 +51,7 @@ async function fetchOne(source, sourceIndex) {
       etag: resp.headers.get("etag"),
       lastModified: resp.headers.get("last-modified"),
     });
-    const entries = parseRSS(text, sourceIndex);
+    const entries = await parseRSSAsync(text, sourceIndex);
     if (!entries.length) throw new Error("解析结果为空");
     return { entries };
   } finally {
