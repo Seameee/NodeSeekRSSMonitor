@@ -201,6 +201,18 @@ docker compose logs -f
 
 优先级：**管理员覆盖 > `.env` 的 `MULTI_USER_ENABLED`**。覆盖值存在数据库里，重启后依然有效；`/admin multiuser default` 可清除覆盖回到环境变量。
 
+### 关于预构建镜像（GHCR）
+
+`ghcr.io/seameee/nodeseek-monitor:latest` 由 GitHub Actions 自动构建（多架构 amd64/arm64）。
+
+**如果拉取时报 `401 Unauthorized` 或 `denied`**，说明该包不是公开的。GHCR 的容器包**默认继承仓库可见性、但需要手动确认为 public**，未公开时除作者与协作者外任何人都拉不到（这不是 `docker login` 能解决的 —— 私有包按协作者授权，陌生人登录也没用）。
+
+仓库作者请到
+`https://github.com/users/Seameee/packages/container/nodeseek-monitor/settings`
+把 Visibility 改为 **Public**。改完无需重新构建。
+
+如果暂时不想公开，请改用下面的从源码构建方式 —— 源码仓库是公开的，无需任何认证。
+
 ### 从源码构建镜像
 
 不想用预构建镜像时，把 `compose.yaml` 里的 `image:` 换成：
@@ -480,6 +492,7 @@ docker compose exec nodeseek-monitor curl -s localhost:8787/healthz | head
 | 日志 `API Key 无法解密` | `APP_MASTER_KEY` 被改过。让该用户重新 `/ai set` |
 | 内存持续增长 | 检查 `WORKER_POOL_SIZE` 与 `AI_CONCURRENCY`；worker 超时会重建，正常不会泄漏 |
 | 容器反复重启，日志 `unable to open database file` | 用了绑定挂载但宿主机目录属主是 root。执行 `sudo chown -R 1000:1000 data`，或改回默认的命名卷 |
+| `docker compose up` 报 `401 Unauthorized` / `denied` | GHCR 上的包不是公开的。作者需把包可见性改为 Public，或改用「从源码构建镜像」 |
 | 别人 `/bind` 提示「单用户模式」 | 这是默认行为。需要开放时发 `/admin multiuser on`，或在 `.env` 里设 `MULTI_USER_ENABLED=true` 后重启 |
 | 自己不是管理员了 | 说明被别的账号抢先 `/bind` 认领了。在 `.env` 里填上 `ADMIN_TELEGRAM_IDS=你的ID` 后重启，即可拿回管理权 |
 
