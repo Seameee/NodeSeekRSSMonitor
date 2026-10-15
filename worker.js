@@ -155,18 +155,18 @@ async function aiCall(cfg, model, title, body, category) {
   }
 }
 
-// 依次尝试主模型、备用模型…第一个成功的结果即返回。
+// 依次尝试主模型、备用模型…返回第一个成功的结果，并附上实际使用的模型名。
 // 失败包括：网络异常 / 超时 / HTTP 非 2xx / 返回空内容。
 async function aiSummary(cfg, title, body, category) {
   const chain = [...new Set([cfg.model, ...(cfg.fallbackModels || [])].filter(Boolean))];
   for (let i = 0; i < chain.length; i++) {
     const out = await aiCall(cfg, chain[i], title, body, category);
-    if (out) return out;
+    if (out) return { text: out, model: chain[i] };
     if (i < chain.length - 1) {
       console.warn(`[AI] 模型 ${chain[i]} 失败，回退到 ${chain[i + 1]}`);
     }
   }
-  return "";
+  return null;
 }
 
 // ─── RSS 解析 ────────────────────────────────────────────────────────────────
@@ -761,9 +761,9 @@ function buildRichNotifMsg(post, matched, summary, dev) {
   parts.push(`<p>&nbsp;</p>`);
   parts.push(`<p>${meta.join(" · ")}</p>`);
 
-  // 3) 摘要：引用块承载，并用 cite 标明是 AI 生成
+  // 3) 摘要：引用块承载，cite 里标明是 AI 生成并附上实际使用的模型
   if (summary) {
-    parts.push(`<blockquote>${esc(summary)}<cite>AI 摘要</cite></blockquote>`);
+    parts.push(`<blockquote>${esc(summary.text)}<cite>AI 摘要 · ${esc(summary.model)}</cite></blockquote>`);
   }
 
   // 4) 命中关键词：短的内联展开，长的默认折叠（避免长正则刷屏）
@@ -813,7 +813,7 @@ function buildNotifMsg(post, matched, summary, dev) {
   return (
     head +
     `📌 <b>${esc(post.title)}</b>\n` +
-    (summary ? `📝 <blockquote>${esc(summary)}</blockquote>\n` : "") +
+    (summary ? `📝 <i>${esc(summary.model)}</i>\n<blockquote>${esc(summary.text)}</blockquote>\n` : "") +
     `🏷 ${esc(cn)}\n👤 ${esc(post.author)}\n🔗 ${post.link}`
   );
 }
@@ -946,7 +946,9 @@ async function pollRSS(env) {
           if (s) summaries.set(post.post_id, s);
         })
       );
-      console.log(`[AI] 摘要成功 ${summaries.size}/${targets.length} 条`);
+      // 实际使用的模型可能因回退而与链路首项不同，日志里如实记录
+      const used = [...new Set([...summaries.values()].map((s) => s.model))];
+      console.log(`[AI] 摘要成功 ${summaries.size}/${targets.length} 条${used.length ? `（实际使用：${used.join("、")}）` : ""}`);
     } else {
       const why = ai.minLen > 0 ? `空正文或短于 ${ai.minLen} 字` : "正文为空";
       console.log(`[AI] 本轮 ${toSend.length} 条通知均无可用正文（${why}），跳过摘要`);
