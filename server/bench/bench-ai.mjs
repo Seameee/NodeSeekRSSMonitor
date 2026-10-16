@@ -6,8 +6,11 @@
 // 总耗时 ≈ N × 单次延迟，而不是 (N / AI_CONCURRENCY) × 单次延迟。
 //
 // 本脚本用固定的上游延迟把两种形状实测出来做对照：
-//   A. 现状形状：逐个用户 await（模拟 poller 的 for 循环）
-//   B. 拍平形状：把所有用户的摘要任务一次性丢进同一个全局信号量
+//   A. 旧形状（2026-10 已修复）：逐个用户 await
+//   B. 现形状（生产在跑）：把所有用户的摘要任务一次性丢进同一个全局信号量
+//
+// 2026-10-16 起 poller.js 第 4 步已改成 B，并额外加了「同内容在飞合并」，
+// 所以这里的 B 是生产形状的下界：真实情况下多个用户命中同一条帖时还会更快。
 //
 // 用法：node bench/bench-ai.mjs
 // ============================================================================
@@ -81,7 +84,7 @@ for (let u = 0; u < USERS; u++) {
   await aiSemaphore.runAll([async () => aiSummary(cfg, TITLE, BODY, "交易")]);
 }
 const a = ms(tA);
-console.log(`\nA 现状形状（逐用户 await）      ${a.toFixed(0).padStart(8)} ms   上游调用 ${calls} 次`);
+console.log(`\nA 旧形状（逐用户 await，已修复）      ${a.toFixed(0).padStart(8)} ms   上游调用 ${calls} 次`);
 
 // ─── B. 拍平：一次丢进全局信号量 ─────────────────────────────────────────────
 
@@ -91,13 +94,13 @@ await aiSemaphore.runAll(
   Array.from({ length: USERS }, () => async () => aiSummary(cfg, TITLE, BODY, "交易"))
 );
 const b = ms(tB);
-console.log(`B 拍平形状（全局并发）          ${b.toFixed(0).padStart(8)} ms   上游调用 ${calls} 次`);
+console.log(`B 现形状（全局并发，生产在跑）          ${b.toFixed(0).padStart(8)} ms   上游调用 ${calls} 次`);
 
 console.log(`\n  B 比 A 快 ${(a / b).toFixed(1)}×`);
 console.log(`  理论上限 A ≈ 用户数 × 延迟 = ${USERS} × ${LATENCY} ms = ${USERS * LATENCY} ms`);
 console.log(`  理论上限 B ≈ 用户数 / 并发 × 延迟 = ${USERS}/${config.aiConcurrency} × ${LATENCY} ms = ${((USERS / config.aiConcurrency) * LATENCY).toFixed(0)} ms`);
 console.log(
-  `\n  照 A 的形状，一小时内最多能服务 ${Math.round(3_600_000 / (LATENCY * 1))} 个「用户×摘要」；` +
+  `\n  照旧形状 A，一小时内最多能服务 ${Math.round(3_600_000 / (LATENCY * 1))} 个「用户×摘要」；` +
     `按每轮 60 秒算，每轮上限 ${Math.round(60_000 / LATENCY)} 条`
 );
 

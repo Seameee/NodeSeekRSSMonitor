@@ -4,10 +4,69 @@
 // 每个用户一份独立配置，API Key 从库里解密后仅存活于本次调用。
 // 未配置 AI 的用户完全不进入这条路径 —— 零额外开销、零泄漏面。
 // ============================================================================
+import { createHash } from "node:crypto";
 import { DEFAULT_AI_PROMPT, config } from "./config.js";
 import { tryDecryptSecret } from "./crypto.js";
 import { getAiConfig } from "./db.js";
 import { log } from "./logger.js";
+
+// ─── 摘要缓存与上游调用计数 ──────────────────────────────────────────────────
+//
+// 摘要是「模型链 + 提示词 + 标题 + 正文 + 版块」的纯函数，而多用户下同一条
+// 帖子会被 N 个用户各请求一次 —— 实测 200 个用户命中同一条帖时，200 次请求
+// 里内容只有 1 种（重复率 99.5%）。这里按内容做有界缓存，把重复的上游调用
+// 直接吃掉。
+//
+// 只缓存**成功**结果：失败不缓存，否则一次上游抖动会把后续请求全挡在缓存外。
+// 命中缓存的用户照常计入自己的 AI 配额（口径与不缓存时完全一致）。
+const summaryCache = new Map(); // key -> { text, model }
+const SUMMARY_CACHE_MAX = 2000;
+// 同一内容的在飞请求：拍平之后 N 个用户会在同一瞬间请求同一条帖子，
+// 各自独立去请求就变成 N 次一模一样的调用（惊群）。后来者直接等第一个人的结果。
+const inflight = new Map(); // key -> Promise<{ text, model } | null>
+const aiStats = { upstreamCalls: 0, cacheHits: 0, coalesced: 0 };
+
+export const aiRuntimeStats = () => ({ ...aiStats, cacheSize: summaryCache.size });
+
+export function clearSummaryCache() {
+  summaryCache.clear();
+}
+
+/** 命中后挪到队尾，否则热条目会被后来的新条目按插入顺序挤出去 */
+function touchCache(key, hit) {
+  summaryCache.delete(key);
+  summaryCache.set(key, hit);
+  return { text: hit.text, model: hit.model, cached: true };
+}
+
+function rememberSummary(key, hit) {
+  if (summaryCache.size >= SUMMARY_CACHE_MAX) {
+    // Map 保持插入顺序，第一个键就是最久未使用的
+    summaryCache.delete(summaryCache.keys().next().value);
+  }
+  summaryCache.set(key, hit);
+}
+
+/** 缓存键：只要会影响输出内容的输入变了一个字节，就必须是另一个键。
+ *  base 也必须进键 —— 不同上游对同名模型给出的答案未必相同，用户既然自己
+ *  配了地址，就不该拿到别的上游产出的摘要（同上游的用户之间照常共享）。 */
+function summaryCacheKey(cfg, title, body, category) {
+  return createHash("sha256")
+    .update(String(cfg.base ?? ""))
+    .update("\u0000")
+    .update(String(cfg.prompt ?? ""))
+    .update("\u0000")
+    .update(String(cfg.model ?? ""))
+    .update("\u0000")
+    .update((cfg.fallbackModels || []).join(","))
+    .update("\u0000")
+    .update(String(category ?? ""))
+    .update("\u0000")
+    .update(String(title ?? ""))
+    .update("\u0000")
+    .update(String(body ?? ""))
+    .digest("hex");
+}
 
 /** 把库里的行转成运行时配置；Key 解密失败返回 null（视为未配置） */
 export function resolveAiConfig(row) {
@@ -59,6 +118,7 @@ export function plainText(html, limit = 2000) {
 export async function aiCall(cfg, model, title, body, category) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), cfg.timeout);
+  aiStats.upstreamCalls++;
   try {
     const resp = await fetch(`${cfg.base}/chat/completions`, {
       method: "POST",
@@ -95,17 +155,45 @@ export async function aiCall(cfg, model, title, body, category) {
   }
 }
 
-/** 依次尝试主模型与备用模型，返回 { text, model } 或 null */
+/** 依次尝试主模型与备用模型，返回 { text, model, cached? } 或 null */
 export async function aiSummary(cfg, title, body, category) {
-  const chain = [...new Set([cfg.model, ...(cfg.fallbackModels || [])].filter(Boolean))];
-  for (let i = 0; i < chain.length; i++) {
-    const out = await aiCall(cfg, chain[i], title, body, category);
-    if (out) return { text: out, model: chain[i] };
-    if (i < chain.length - 1) {
-      log.warn("ai", `模型 ${chain[i]} 失败，回退到 ${chain[i + 1]}`);
-    }
+  const key = summaryCacheKey(cfg, title, body, category);
+
+  const cached = summaryCache.get(key);
+  if (cached) {
+    aiStats.cacheHits++;
+    return touchCache(key, cached);
   }
-  return null;
+
+  const pending = inflight.get(key);
+  if (pending) {
+    // 已经有人为同一份内容在请求上游了，跟着他的结果走，不再打一次
+    aiStats.coalesced++;
+    return pending;
+  }
+
+  const p = (async () => {
+    const chain = [...new Set([cfg.model, ...(cfg.fallbackModels || [])].filter(Boolean))];
+    for (let i = 0; i < chain.length; i++) {
+      const out = await aiCall(cfg, chain[i], title, body, category);
+      if (out) {
+        const hit = { text: out, model: chain[i] };
+        rememberSummary(key, hit);
+        return hit;
+      }
+      if (i < chain.length - 1) {
+        log.warn("ai", `模型 ${chain[i]} 失败，回退到 ${chain[i + 1]}`);
+      }
+    }
+    return null; // 失败不进缓存，避免一次上游抖动把后续请求全挡在缓存外
+  })();
+
+  inflight.set(key, p);
+  try {
+    return await p;
+  } finally {
+    if (inflight.get(key) === p) inflight.delete(key);
+  }
 }
 
 /**

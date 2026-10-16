@@ -33,7 +33,7 @@ import {
   isAdminUser,
   isMultiUserEnabled,
 } from "./db.js";
-import { resolveAiConfig, aiSummary, plainText } from "./ai.js";
+import { resolveAiConfig, aiSummary, aiRuntimeStats, plainText } from "./ai.js";
 import { matchPostsAsync } from "./worker-pool.js";
 import { fetchEntries } from "./rss.js";
 import { buildRichNotifMsg, buildNotifMsg, buildOverflowMsg } from "./notify.js";
@@ -80,6 +80,10 @@ export function pollerStats() {
 export async function runRound() {
   const started = Date.now();
   stats.rounds++;
+  // lastAiCalls 是「本轮」的摘要条数，必须每轮清零：
+  // 之前只做 += 从不清零，于是它其实是个累计值 —— 日志里的「摘要 N 条」
+  // 和返回值 aiCalls 会一轮比一轮大，即使当轮一条摘要都没生成。
+  stats.lastAiCalls = 0;
 
   // ── 1. 只抓一次 ────────────────────────────────────────────────────────
   let fetched;
@@ -164,9 +168,29 @@ export async function runRound() {
     };
   });
 
-  // ── 4. 汇总待发送任务 ──────────────────────────────────────────────────
+  // ── 4. 汇总待发送任务 + 把所有用户的 AI 摘要任务**拍平成一个池** ────────
+  //
+  // 这里刻意分成「准备 → 一次性跑 → 回填」三步，而不是逐个用户 await：
+  // aiSemaphore 是全局的，但如果写成 `for (job of jobs) await runAll(...)`，
+  // 每个用户的批次会串行等待，跨用户等于完全没有并发 —— 实测 200 个用户各 1
+  // 条摘要时，串行 20098ms vs 拍平 2510ms，差整整一个 AI_CONCURRENCY 倍。
   const jobs = perUser.filter((x) => x && x.posts && x.posts.length);
   const pushJobs = [];
+  const pushOwners = []; // 与 pushJobs 对齐：溢出消息为 null
+  const plans = []; // 每个用户一份，供摘要回填与记账
+  const aiTasks = [];
+  // 正文纯文本与用户无关，一轮内同一条帖子只解析一次。
+  // 拍平后所有任务会同时存活，不共用的话 2000 个用户命中同一条帖就会各留一份
+  // 2KB 正文的副本（约 20MB 的无谓占用）。
+  const bodyCache = new Map();
+  const bodyOf = (post) => {
+    let b = bodyCache.get(post.post_id);
+    if (b === undefined) {
+      b = plainText(post.content);
+      bodyCache.set(post.post_id, b);
+    }
+    return b;
+  };
 
   for (const job of jobs) {
     const { uid, user, posts: hits } = job;
@@ -175,57 +199,74 @@ export async function runRound() {
     const budget = Math.max(0, quota.dailyPush - usage.pushes);
     const usable = hits.slice(0, budget);
 
+    const plan = { uid, summaries: new Map(), targets: 0 };
+    plans.push(plan);
+
     // AI 摘要：只对配置了 AI 且还有配额的用户做
-    let summaries = new Map();
     const ai = aiByUser.get(uid);
     if (ai && usable.length) {
-      const aiQuota = quota.dailyAi;
-      const aiUsed = getUsage(uid).ai_calls;
-      const aiBudget = Math.max(0, aiQuota - aiUsed);
+      const aiBudget = Math.max(0, quota.dailyAi - usage.ai_calls);
       if (aiBudget <= 0) {
         if (shouldNotifyQuota(uid, "ai")) {
-          await sendMessage(uid, `⚠️ 你今日的 AI 摘要配额已用尽（${aiUsed}/${aiQuota}），明日恢复。`);
+          await sendMessage(uid, `⚠️ 你今日的 AI 摘要配额已用尽（${usage.ai_calls}/${quota.dailyAi}），明日恢复。`);
         }
       } else {
         const targets = usable
-          .map(({ post }) => ({ post, body: plainText(post.content) }))
+          .map(({ post }) => ({ post, body: bodyOf(post) }))
           .filter(({ body }) => body.length > 0 && body.length >= ai.minLen)
           .slice(0, Math.min(ai.maxPerRound, aiBudget));
-        if (targets.length) {
-          // 并发预取，但受全局信号量限制
-          const results = await aiSemaphore.runAll(
-            targets.map(({ post, body }) => async () => {
-              const cn = CATEGORIES[post.category] || post.category;
-              const s = await aiSummary(ai, post.title, body, cn);
-              return { post_id: post.post_id, summary: s };
-            })
-          );
-          for (const r of results) {
-            if (r?.summary) summaries.set(r.post_id, r.summary);
-          }
-          const used = summaries.size;
-          if (used > 0) {
-            incrUsage(uid, "ai_calls", used);
-            stats.lastAiCalls += used;
-            const models = [...new Set([...summaries.values()].map((s) => s.model))];
-            log.info("ai", `用户 ${uid} 生成 ${used}/${targets.length} 条摘要（${models.join("、")}）`);
-          }
+        plan.targets = targets.length;
+        for (const { post, body } of targets) {
+          aiTasks.push({ plan, ai, post, body, cn: CATEGORIES[post.category] || post.category });
         }
       }
     }
 
     for (const { post, matched } of usable) {
-      pushJobs.push({
-        uid,
-        post,
-        matched,
-        summary: summaries.get(post.post_id) || null,
-      });
+      pushJobs.push({ uid, post, matched, summary: null });
+      pushOwners.push({ plan, post_id: post.post_id });
     }
 
     if (job.overflow > 0) {
       pushJobs.push({ uid, overflow: true, items: usable.map((h) => h.post), total: job.overflow });
+      pushOwners.push(null);
     }
+  }
+
+  // 所有用户的摘要任务一次性丢进同一个全局信号量
+  if (aiTasks.length) {
+    const before = aiRuntimeStats();
+    const results = await aiSemaphore.runAll(
+      aiTasks.map((t) => async () => {
+        const s = await aiSummary(t.ai, t.post.title, t.body, t.cn);
+        return s ? { plan: t.plan, post_id: t.post.post_id, summary: s } : null;
+      })
+    );
+    for (const r of results) {
+      if (r) r.plan.summaries.set(r.post_id, r.summary);
+    }
+    const after = aiRuntimeStats();
+    const upstream = after.upstreamCalls - before.upstreamCalls;
+    const hits = after.cacheHits - before.cacheHits;
+    const merged = after.coalesced - before.coalesced;
+    log.info(
+      "ai",
+      `本轮摘要任务 ${aiTasks.length} 个：上游实际调用 ${upstream} 次，命中缓存 ${hits} 个，同内容合并 ${merged} 个`
+    );
+  }
+
+  // 记账 + 把摘要回填到各自的推送任务
+  for (const plan of plans) {
+    const used = plan.summaries.size;
+    if (!used) continue;
+    incrUsage(plan.uid, "ai_calls", used);
+    stats.lastAiCalls += used;
+    const models = [...new Set([...plan.summaries.values()].map((s) => s.model))];
+    log.info("ai", `用户 ${plan.uid} 生成 ${used}/${plan.targets} 条摘要（${models.join("、")}）`);
+  }
+  for (let i = 0; i < pushJobs.length; i++) {
+    const owner = pushOwners[i];
+    if (owner) pushJobs[i].summary = owner.plan.summaries.get(owner.post_id) || null;
   }
 
   // ── 5. 并发发送 ────────────────────────────────────────────────────────

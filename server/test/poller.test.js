@@ -14,6 +14,7 @@ import { installFetchMock, makeRss, teardown } from "./helpers.js";
 const db = await import("../src/db.js");
 const crypto = await import("../src/crypto.js");
 const poller = await import("../src/poller.js");
+const ai = await import("../src/ai.js");
 
 test.after(async () => {
   await teardown();
@@ -34,6 +35,9 @@ const POSTS = [
 ];
 
 function setupUsers() {
+  // 摘要缓存是进程级状态，同一个测试文件里多轮用例会互相命中 ——
+  // 不清掉的话，后一个用例的「上游调用次数」断言会被前一个用例的缓存吃掉。
+  ai.clearSummaryCache();
   for (const id of [U_KW, U_AI, U_NONE]) {
     db.deleteUser(id);
     db.createUser({ telegramId: id, username: `u${id}` });
