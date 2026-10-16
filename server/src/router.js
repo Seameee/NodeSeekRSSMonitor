@@ -59,8 +59,15 @@ async function doBind(chatId, from) {
   }
 
   // ── 分支 1：首个用户认领所有权 ──────────────────────────────────────────
-  // 无需检查多用户开关：部署后第一个人必须是管理员，否则没人能管理这个实例
-  if (!hasAnyUser()) {
+  // 无需检查多用户开关：部署后第一个人必须是管理员，否则没人能管理这个实例。
+  //
+  // **但配了 ADMIN_TELEGRAM_IDS 时只允许白名单里的人认领**：「没人能管理」这个
+  // 前提只在未配白名单时成立；配了白名单的话，白名单管理员本来就能 /bind 拿回
+  // 管理权（见下面分支 3 的放行）。若仍让陌生人认领，等于把实例管理员直接送给
+  // 第一个碰巧发 /bind 的人，白名单就形同虚设了。
+  // 非白名单用户会继续往下走：单用户模式被拒、多用户模式注册为普通用户。
+  const mayClaimOwnership = config.adminIds.size === 0 || config.adminIds.has(id);
+  if (mayClaimOwnership && !hasAnyUser()) {
     const claimed = claimOwnership({
       telegramId: id,
       username: from.username,

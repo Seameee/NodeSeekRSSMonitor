@@ -23,15 +23,18 @@ test.after(async () => {
 const STRANGER = 8101;
 const OWNER = 8102;
 
-test("F1：单用户模式下白名单管理员仍能 /bind 找回管理权", async () => {
-  for (const id of [STRANGER, OWNER, 2001, 2002]) db.deleteUser(id);
-  config.adminIds.add(OWNER);
-  db.setMultiUserEnabled(false); // 明确单用户（默认模式）
+test("F1：事后补上白名单，真主人能 /bind 找回管理权", async () => {
+  for (const u of db.listUsers({ limit: 100_000 })) db.deleteUser(u.telegram_id);
+  config.adminIds.clear();
+  db.setMultiUserEnabled(false); // 单用户（默认模式）
   const { sent } = installFetchMock();
 
-  // 陌生人抢先认领
+  // 场景起点：未配白名单，陌生人抢先认领（此时确实无人能管，认领是合理的）
   await router.handleUpdate(makeUpdate("/bind", { id: STRANGER, username: "stranger" }));
-  assert.equal(db.getUser(STRANGER).role, "admin", "首个用户应认领为管理员");
+  assert.equal(db.getUser(STRANGER)?.role, "admin", "无白名单时首个用户应认领为管理员");
+
+  // 运维发现后补上 ADMIN_TELEGRAM_IDS 并重启（这里以运行时加白名单模拟）
+  config.adminIds.add(OWNER);
 
   // 白名单主人 /bind —— 修复前这里会被「本实例当前为单用户模式」拒绝
   await router.handleUpdate(makeUpdate("/bind", { id: OWNER, username: "owner" }));
@@ -106,4 +109,40 @@ test("F2：删号重绑后，旧关键词不得再产生推送", async () => {
   );
 
   db.setMultiUserEnabled(true);
+});
+
+test("F1b：配了白名单时，陌生人不得抢先认领管理员", async () => {
+  // 把用户表清空，制造「全新实例」的状态
+  for (const u of db.listUsers({ limit: 100_000 })) db.deleteUser(u.telegram_id);
+  assert.equal(db.hasAnyUser(), false, "前置：用户表应为空");
+
+  config.adminIds.add(OWNER);
+  db.setMultiUserEnabled(false); // 单用户（默认）
+
+  const { sent } = installFetchMock();
+
+  // 非白名单的陌生人先 /bind —— 修复前这里会直接把他变成管理员
+  await router.handleUpdate(makeUpdate("/bind", { id: STRANGER, username: "stranger" }));
+  const stranger = db.getUser(STRANGER);
+  assert.ok(!stranger, "陌生人不应被创建（单用户模式）");
+  assert.match(sent.at(-1)?.html || "", /单用户模式|联系实例管理员/, "应被单用户模式拒绝");
+
+  // 白名单主人再 /bind —— 应当成为管理员
+  await router.handleUpdate(makeUpdate("/bind", { id: OWNER, username: "owner" }));
+  assert.equal(db.getUser(OWNER)?.role, "admin", "白名单主人应成为管理员");
+
+  config.adminIds.delete(OWNER);
+  db.resetMultiUserEnabled();
+});
+
+test("F1c：未配白名单时，首个 /bind 仍照常认领（保留原有行为）", async () => {
+  for (const u of db.listUsers({ limit: 100_000 })) db.deleteUser(u.telegram_id);
+  config.adminIds.clear();
+  db.setMultiUserEnabled(false);
+
+  installFetchMock();
+  await router.handleUpdate(makeUpdate("/bind", { id: STRANGER, username: "first" }));
+  assert.equal(db.getUser(STRANGER)?.role, "admin", "无白名单时首个用户应认领为管理员");
+
+  db.resetMultiUserEnabled();
 });
