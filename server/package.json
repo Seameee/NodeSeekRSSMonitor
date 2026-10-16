@@ -5,7 +5,7 @@
   "description": "NodeSeek 关键词监控 Bot — 原生 Node.js 多用户服务端（Docker 部署）",
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "main": "src/index.js",
   "scripts": {

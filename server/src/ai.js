@@ -141,8 +141,13 @@ export function validateBaseUrl(raw) {
     /^172\.(1[6-9]|2\d|3[01])\./,
     /^\[?::1\]?$/,
     /^\[?fc00:/i,
+    /^\[?fd[0-9a-f]{2}:/i, // ULA fd00::/8（此前只挡了 fc00:，fd 段可绕过）
     /^\[?fe80:/i,
+    /^\[?::ffff:/i, // IPv4-mapped IPv6
+    // CGNAT 100.64.0.0/10：含阿里云 ECS 元数据 100.100.100.200
+    /^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\./,
     /\.internal$/,
+    /\.localhost$/,
   ];
   if (blocked.some((re) => re.test(host))) {
     return { ok: false, reason: "Base URL 不能指向内网或本机地址" };

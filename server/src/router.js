@@ -88,8 +88,12 @@ async function doBind(chatId, from) {
     );
   }
 
-  // ── 分支 3：单用户模式下拒绝新用户 ──────────────────────────────────────
-  if (!isMultiUserEnabled()) {
+  // 白名单管理员必须一路放行：这是 README 承诺的「找回管理权」入口，
+  // 若把它和普通新用户一起挡掉，实例被陌生人抢先认领后就再无入口。
+  const whitelisted = config.adminIds.has(id);
+
+  // ── 分支 3：单用户模式下拒绝新用户（白名单管理员除外）──────────────────
+  if (!isMultiUserEnabled() && !whitelisted) {
     return reply(
       chatId,
       "🚪 <b>本实例当前为单用户模式</b>\n\n只有管理员可以使用。\n" +
@@ -98,7 +102,7 @@ async function doBind(chatId, from) {
   }
 
   // ── 分支 2：多用户模式下的常规注册 ──────────────────────────────────────
-  if (!config.registrationOpen) {
+  if (!config.registrationOpen && !whitelisted) {
     return reply(chatId, "🚪 当前未开放注册，请联系管理员开通。");
   }
 

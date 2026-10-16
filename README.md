@@ -219,7 +219,7 @@ docker compose logs -f
 
 ```yaml
     build:
-      context: https://github.com/Seameee/NodeSeekRSSMonitor.git#main:server
+      context: https://github.com/Seameee/NodeSeekRSSMonitor.git#docker:server
 ```
 
 或本地克隆后：
@@ -255,8 +255,8 @@ docker compose up -d --build
 | `REGISTRATION_OPEN` | `true` | 多用户模式下是否允许自助 `/bind`；关闭后仅管理员能开通（单用户模式下不生效） |
 | `MAX_USERS` | `200` | 用户总数上限（仅多用户模式） |
 | `DEFAULT_MAX_KEYWORDS` | `20` | 新用户关键词数量上限 |
-| `DEFAULT_DAILY_AI_QUOTA` | `100` | 新用户每日 AI 调用上限 |
-| `DEFAULT_DAILY_PUSH_QUOTA` | `200` | 新用户每日推送条数上限 |
+| `DEFAULT_DAILY_AI_QUOTA` | `0` | 新用户每日 AI 调用上限（**0 = 不限**） |
+| `DEFAULT_DAILY_PUSH_QUOTA` | `500` | 新用户每日推送条数上限 |
 | `COMMAND_RATE_PER_MIN` | `20` | 每用户每分钟命令数上限 |
 | `WORKER_POOL_SIZE` | `4` | worker 线程数；设 `0` 则退化为单线程 |
 | `AI_CONCURRENCY` | `8` | 同时在飞的 AI 请求数 |
@@ -276,7 +276,7 @@ docker compose up -d --build
 | `/pause` / `/resume <序号\|关键词>` | 暂停 / 恢复关键词 |
 | `/list` | 查看自己的关键词 |
 | `/categories` | 查看可用版块 |
-| `/ai set <key> [模型] [base_url]` | 配置 AI 摘要 |
+| `/ai set <key> [base_url]` | 配置 AI 摘要 |
 | `/ai fallback <模型1,模型2>` | 设置备用模型链 |
 | `/ai test` | 连通性测试 |
 | `/ai status` / `/ai on` / `/ai off` / `/ai clear` | 查看 / 开关 / 清除 |
@@ -350,6 +350,10 @@ docker compose up -d --build
 
 **SSRF 防护**
 
+`base_url` 由用户提供，只做**词法**校验：拒绝本机/内网/链路本地/CGNAT（含云元数据 100.100.100.200）/ULA/IPv4-mapped 等字面量地址。
+
+> **残余风险**：词法校验挡不住「攻击者控制的域名解析到内网」。单用户自用可接受；**公开多用户部署**应再加一层 —— 在容器出口做 egress 限制（只允许访问必要公网），或改为解析 DNS 后校验目标 IP。当前未实现后者。
+
 `/ai set` 的 `base_url` 会校验协议并拒绝解析到内网/本机地址（`127.`、`10.`、`192.168.`、`169.254.`、`localhost`、`::1` 等）。
 
 **容器加固**
@@ -364,8 +368,8 @@ compose 里默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件�
 | --- | --- | --- |
 | 命令频率 | 每用户令牌桶 | 20 条/分钟 |
 | 注册 | 冷却时间 + 总人数上限 | 30 秒 / 200 人 |
-| 资源消耗 | 每用户每日 AI 调用配额 | 100 次 |
-| 推送量 | 每用户每日推送配额 | 200 条 |
+| 资源消耗 | 每用户每日 AI 调用配额 | 不限（默认 0）|
+| 推送量 | 每用户每日推送配额 | 500 条 |
 | 关键词数量 | 每用户上限 | 20 条 |
 | 单轮规模 | 单用户单轮推送上限 | 10 条（超出合并汇总） |
 | 全局限流 | Telegram 发送速率 | 20 条/秒 |
@@ -698,7 +702,7 @@ Docker 多用户版的全部文件在 `server/` 目录：
 | `server/Dockerfile`            | 多阶段构建，基于 `node:24-alpine`，非 root 运行             |
 | `server/docker-compose.yml`    | Compose 部署编排，含安全加固与资源限制                      |
 | `server/.env.example`          | 环境变量模板，含全部可调项与说明                            |
-| `server/test/`                 | 测试套件（41 项，覆盖加密、隔离、权限、轮询与配额）          |
+| `server/test/`                 | 测试套件（90 项，覆盖加密、隔离、权限、轮询与配额）          |
 | `.github/workflows/docker.yml` | 自动构建多架构镜像并推送到 GHCR                             |
 
 ## 数据表

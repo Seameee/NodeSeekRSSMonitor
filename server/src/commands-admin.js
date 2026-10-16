@@ -6,6 +6,7 @@
 // 每次调用都会写审计日志。用户命令里没有任何管理员能力，反之亦然。
 // ============================================================================
 import { config } from "./config.js";
+import { invalidateKeywordCache } from "./poller.js";
 import {
   audit,
   countKeywords,
@@ -72,7 +73,6 @@ export async function handleAdminCommand(ctx, rest) {
 
     case "stats": {
       const total = countUsers();
-      const active = listUsers({ limit: 1, status: "active" }).length ? null : null;
       const today = totalUsage();
       const rl = rateLimitStats();
       const ps = pool.stats();
@@ -194,6 +194,8 @@ export async function handleAdminCommand(ctx, rest) {
       if (!u) return reply(chatId, "未找到该用户。");
       if (isAdminUser(u)) return reply(chatId, "⚠️ 不能删除管理员账号。");
       deleteUser(id);
+      // 必须同时清进程内缓存，否则同 ID 重绑后会命中删除前的关键词
+      invalidateKeywordCache(id);
       return done(`🗑 已删除用户 <code>${id}</code> 及其全部数据`, `del ${id}`);
     }
 

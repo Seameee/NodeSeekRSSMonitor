@@ -418,7 +418,7 @@ async function cmdAi(ctx, rest) {
           `<b>参数</b>：正文≥${existing.min_len} · 每轮≤${existing.max_per_round} · max_tokens ${existing.max_tokens} · 超时 ${existing.timeout_ms}ms\n` +
           `<b>今日用量</b>：${used}/${formatQuota(q.dailyAi)}\n` +
           `<b>提示词</b>：${existing.prompt ? "自定义" : "默认"}\n\n` +
-          `<i>密钥无法还原为明文，忘记请直接 /ai set 覆盖。</i>`
+          `<i>密钥加密存储、不提供查看明文的入口；忘记请直接 /ai set 覆盖。</i>`
       );
     }
 

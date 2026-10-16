@@ -151,8 +151,15 @@ export function getSetting(key, def = null) {
 
 /** 判断某人是否是管理员：环境变量白名单 或 库内 role=admin */
 export function isAdminUser(userOrId) {
-  const user = typeof userOrId === "object" && userOrId !== null ? userOrId : getUser(userOrId);
-  if (!user) return false;
+  const obj = typeof userOrId === "object" && userOrId !== null ? userOrId : null;
+  const user = obj ? obj : getUser(userOrId);
+  if (!user) {
+    // 未注册也要认白名单。否则单用户模式（默认）下实例被陌生人抢先 /bind 认领后，
+    // ADMIN_TELEGRAM_IDS 里的真主人既进不了 /admin、又会被单用户模式挡住 /bind，
+    // 彻底找不回管理权 —— README 承诺的那条路径形同虚设。
+    const id = obj ? obj.telegram_id : userOrId;
+    return config.adminIds.has(Number(id));
+  }
   return user.role === "admin" || config.adminIds.has(user.telegram_id);
 }
 
@@ -228,6 +235,10 @@ export function deleteUser(telegramId) {
     for (const t of ["keywords", "ai_configs", "seen_posts", "notifications", "usage_daily"]) {
       prep(`DELETE FROM ${t} WHERE telegram_id=?`).run(telegramId);
     }
+    // 关键词修订号必须一并清掉：否则同一个 Telegram ID 重新 /bind 后，
+    // loadKeywordsFor 会读到残留修订号、复用删除前的关键词缓存，
+    // 表现为「库里 0 条关键词却照常收到推送」。
+    prep("DELETE FROM settings WHERE key=?").run(keywordRevisionKey(telegramId));
     const n = prep("DELETE FROM users WHERE telegram_id=?").run(telegramId).changes;
     db.exec("COMMIT");
     return n;

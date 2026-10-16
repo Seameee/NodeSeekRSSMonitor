@@ -38,13 +38,13 @@ const chatLocks = new Map(); // chatId -> Promise 链尾
 function withChatLock(chatId, fn) {
   const prev = chatLocks.get(chatId) || Promise.resolve();
   const next = prev.then(fn, fn);
-  // 链尾只用于排队，不保留结果；定期清理避免 Map 无限增长
-  chatLocks.set(
-    chatId,
-    next.catch(() => {})
-  );
-  next.finally(() => {
-    if (chatLocks.get(chatId) === next || chatLocks.size > 5000) chatLocks.delete(chatId);
+  // 链尾只用于排队，不保留结果。注意存进去的是派生 promise，清理时也必须
+  // 拿同一个引用比较——之前比较的是 next 本身，恒为 false，条目永不释放，
+  // 只能等 size>5000 时被误删（还会波及仍在排队的 chat）。
+  const tail = next.catch(() => {});
+  chatLocks.set(chatId, tail);
+  tail.finally(() => {
+    if (chatLocks.get(chatId) === tail) chatLocks.delete(chatId);
   });
   return next;
 }
