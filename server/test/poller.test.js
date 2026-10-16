@@ -101,14 +101,11 @@ test("产品约定：配置了 AI 的用户会拿到摘要，并标注实际使�
   await poller.runRound();
 
   const aiMsgs = sent.filter((m) => m.chatId === U_AI);
-  // 命中 2 条现在会**合并成 1 条消息**（见 poller 第 5 步），
-  // 但摘要仍是每条帖子各一份，且都要带上实际使用的模型
-  assert.equal(aiMsgs.length, 1, `U_AI 的 2 条命中应合并成 1 条消息（实际 ${aiMsgs.length}）`);
-  assert.match(aiMsgs[0].html, /绿云/, "合并消息里应包含第 1 条命中");
-  assert.match(aiMsgs[0].html, /搬瓦工/, "合并消息里应包含第 2 条命中");
-  const modelTags = aiMsgs[0].html.match(/AI 摘要 · test-model/g) || [];
-  assert.equal(modelTags.length, 2, `两条帖子应各带一处模型标注（实际 ${modelTags.length}）`);
-  // 只有 U_AI 会调 AI，且每条命中一次（两条帖子内容不同，不会命中摘要缓存）
+  assert.equal(aiMsgs.length, 2, `U_AI 命中 2 条（实际 ${aiMsgs.length}）`);
+  for (const m of aiMsgs) {
+    assert.match(m.html, /AI 摘要 · test-model/, "应标注实际使用的模型");
+  }
+  // 只有 U_AI 会调 AI，且每条命中一次
   assert.equal(aiCalls.length, 2, `应恰好调用 2 次 AI（实际 ${aiCalls.length}）`);
   assert.ok(
     aiCalls.every((c) => c.auth === "Bearer sk-fake-key-1234567890"),

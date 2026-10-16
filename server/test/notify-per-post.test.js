@@ -1,13 +1,14 @@
 // ============================================================================
-// 推送合并：同一用户本轮的多条命中合成尽量少的几条消息
+// 推送格式：**每条命中各发一条消息，不合并**
 //
-// 背景：发送是整轮里唯一躲不掉的串行瓶颈（全局令牌桶 20 条/秒，实测 200 条
-// 要 9.9 秒），而 Telegram 对单聊约 1 msg/s —— 一个用户命中 10 条不仅占掉 10 条
-// 配额，还会因为单聊限速吃 429、退避重试，把整轮拖长。
+// 曾经为了省发送配额做成「一轮多条命中合并成一条消息」，用户看过后否掉了：
+// 合并后几个不相关的帖子挤在一条里（中间只有一条分隔线），既不好扫读也不好
+// 转发。结论是保持原来的「一帖一消息」，发送配额不够就认了。
 //
-// 但也要钉住两件不能变的事：
-//   · 只命中 1 条时，消息必须与合并前**完全一致**（常见情况不能有观感变化）；
-//   · 配额仍然按「交付的帖子条数」计，不能因为合并就悄悄放宽。
+// 这个文件就是把这个决定钉住 —— 谁要是再动合并的念头，先看这里。
+// 同时钉住两件不能变的事：
+//   · 只命中 1 条时的消息，必须与 buildRichNotifMsg 的输出逐字节一致；
+//   · 配额按「交付的帖子条数」计（一帖一消息时也就是消息条数）。
 // ============================================================================
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -38,28 +39,43 @@ const posts = (n, idBase = 960000) =>
     content: "正文内容",
   }));
 
-test("合并：命中 5 条只发 1 条消息，且 5 条都在里面", async () => {
+test("不合并：命中 5 条就发 5 条消息，每条只讲一条帖子", async () => {
   const uid = freshUser();
   const mock = installFetchMock({ rssXml: makeRss(posts(5)) });
   await poller.runRound();
 
   const msgs = mock.sent.filter((m) => m.chatId === uid);
-  assert.equal(msgs.length, 1, `5 条命中应合并成 1 条消息（实际 ${msgs.length}）`);
+  assert.equal(msgs.length, 5, `5 条命中应发 5 条消息（实际 ${msgs.length}）`);
   for (let i = 1; i <= 5; i++) {
-    assert.match(msgs[0].html, new RegExp(`第 ${i} 号`), `第 ${i} 条应在合并消息里`);
+    const hit = msgs.filter((m) => m.html.includes(`第 ${i} 号`));
+    assert.equal(hit.length, 1, `第 ${i} 号应恰好出现在 1 条消息里（实际 ${hit.length}）`);
+    // 并且那条消息里不应混进别的帖子
+    const others = [1, 2, 3, 4, 5].filter((j) => j !== i && hit[0].html.includes(`第 ${j} 号`));
+    assert.deepEqual(others, [], `第 ${i} 号那条里不该混入其它帖子（混入了 ${others.join(",")}）`);
   }
 });
 
-test("合并：配额仍按帖子条数计，不因合并而放宽", async () => {
+test("不合并：不该出现「本轮命中 N 条」这种汇总表头与分隔线", async () => {
+  const uid = freshUser();
+  const mock = installFetchMock({ rssXml: makeRss(posts(3)) });
+  await poller.runRound();
+
+  for (const m of mock.sent.filter((x) => x.chatId === uid)) {
+    assert.doesNotMatch(m.html, /本轮命中\s*\d+\s*条/, "不该出现合并式的汇总表头");
+    assert.doesNotMatch(m.html, /─{6,}/, "不该出现合并用的分隔线");
+  }
+});
+
+test("不合并：配额按帖子条数计（4 条命中 = 4 条用量）", async () => {
   const uid = freshUser();
   const mock = installFetchMock({ rssXml: makeRss(posts(4)) });
   await poller.runRound();
 
-  assert.equal(mock.sent.filter((m) => m.chatId === uid).length, 1, "4 条命中只发 1 条消息");
+  assert.equal(mock.sent.filter((m) => m.chatId === uid).length, 4, "4 条命中应发 4 条消息");
   assert.equal(db.getUsage(uid).pushes, 4, `用量应按 4 条帖子计（实际 ${db.getUsage(uid).pushes}）`);
 });
 
-test("合并：只命中 1 条时，消息与单帖格式逐字节一致", async () => {
+test("不合并：只命中 1 条时，消息与单帖格式逐字节一致", async () => {
   const uid = freshUser();
   const mock = installFetchMock({ rssXml: makeRss(posts(1)) });
   await poller.runRound();
@@ -77,13 +93,12 @@ test("合并：只命中 1 条时，消息与单帖格式逐字节一致", async
   assert.equal(
     msgs[0].html,
     notify.buildRichNotifMsg(post, ["绿云"], null),
-    "单条命中必须仍走原来的单帖消息，不能变成合并格式"
+    "单条命中的消息必须就是单帖格式"
   );
 });
 
-test("合并：内容很长时切成多条，且每条都不超长、标签不残缺", async () => {
+test("不合并：10 条命中就 10 条消息，各自不超长且标签成对", async () => {
   const uid = freshUser();
-  // 关键词命中很多条 + 标题很长 → 逼出分块
   const many = Array.from({ length: 10 }, (_, i) => ({
     id: 970000 + i,
     title: `【出】绿云 ${"很长的标题".repeat(12)} ${i}`,
@@ -94,36 +109,13 @@ test("合并：内容很长时切成多条，且每条都不超长、标签不�
   await poller.runRound();
 
   const msgs = mock.sent.filter((m) => m.chatId === uid);
-  assert.ok(msgs.length >= 1, "至少应有 1 条消息");
+  assert.equal(msgs.length, 10, `10 条命中应发 10 条消息（实际 ${msgs.length}）`);
   for (const m of msgs) {
     assert.ok(m.html.length <= 4096, `单条消息不得超长（实际 ${m.html.length}）`);
-    // 标签必须成对：截断在标签中间会让 Telegram 整条 400 拒收
     for (const tag of ["details", "blockquote", "pre", "code", "h3"]) {
       const open = (m.html.match(new RegExp(`<${tag}[ >]`, "g")) || []).length;
       const close = (m.html.match(new RegExp(`</${tag}>`, "g")) || []).length;
       assert.equal(open, close, `<${tag}> 必须成对（${open} 开 / ${close} 闭）`);
     }
   }
-  // 10 条命中不该只发一条就丢内容
-  const total = msgs.map((m) => m.html).join("");
-  for (let i = 0; i < 10; i++) {
-    assert.match(total, new RegExp(`很长的标题[^<]*${i}<`), `第 ${i} 条不应丢`);
-  }
-});
-
-test("合并：同一用户的多条消息按序发出（先第 1 号后第 2 号）", async () => {
-  const uid = freshUser();
-  const many = Array.from({ length: 10 }, (_, i) => ({
-    id: 980000 + i,
-    title: `【出】绿云 ${"很长的标题".repeat(12)} ${i}`,
-    category: "trade",
-    content: "正文",
-  }));
-  const mock = installFetchMock({ rssXml: makeRss(many) });
-  await poller.runRound();
-
-  const html = mock.sent.filter((m) => m.chatId === uid).map((m) => m.html).join("");
-  const first = html.indexOf("很长的标题 0") >= 0 ? html.indexOf(" 0<") : html.indexOf(" 0");
-  const last = html.lastIndexOf(" 9<") >= 0 ? html.lastIndexOf(" 9<") : html.lastIndexOf(" 9");
-  assert.ok(first >= 0 && last > first, "分块后顺序不应被打乱");
 });

@@ -36,13 +36,7 @@ import {
 import { resolveAiConfig, aiSummary, aiRuntimeStats, plainText } from "./ai.js";
 import { matchPostsAsync } from "./worker-pool.js";
 import { fetchEntries } from "./rss.js";
-import {
-  buildRichNotifMsg,
-  buildNotifMsg,
-  buildOverflowMsg,
-  buildRichDigests,
-  buildPlainDigests,
-} from "./notify.js";
+import { buildRichNotifMsg, buildNotifMsg, buildOverflowMsg } from "./notify.js";
 import { sendMany, sendMessage, sendRichMessage } from "./telegram.js";
 import { shouldNotifyQuota } from "./quota.js";
 import { log } from "./logger.js";
@@ -180,6 +174,8 @@ export async function runRound() {
   // 每个用户的批次会串行等待，跨用户等于完全没有并发 —— 实测 200 个用户各 1
   // 条摘要时，串行 20098ms vs 拍平 2510ms，差整整一个 AI_CONCURRENCY 倍。
   const jobs = perUser.filter((x) => x && x.posts && x.posts.length);
+  const pushJobs = [];
+  const pushOwners = []; // 与 pushJobs 对齐：溢出消息为 null
   const plans = []; // 每个用户一份，供摘要回填与记账
   const aiTasks = [];
   // 正文纯文本与用户无关，一轮内同一条帖子只解析一次。
@@ -202,7 +198,7 @@ export async function runRound() {
     const budget = Math.max(0, quota.dailyPush - usage.pushes);
     const usable = hits.slice(0, budget);
 
-    const plan = { uid, usable, summaries: new Map(), targets: 0, overflow: job.overflow || 0 };
+    const plan = { uid, summaries: new Map(), targets: 0 };
     plans.push(plan);
 
     // AI 摘要：只对配置了 AI 且还有配额的用户做
@@ -223,6 +219,16 @@ export async function runRound() {
           aiTasks.push({ plan, ai, post, body, cn: CATEGORIES[post.category] || post.category });
         }
       }
+    }
+
+    for (const { post, matched } of usable) {
+      pushJobs.push({ uid, post, matched, summary: null });
+      pushOwners.push({ plan, post_id: post.post_id });
+    }
+
+    if (job.overflow > 0) {
+      pushJobs.push({ uid, overflow: true, items: usable.map((h) => h.post), total: job.overflow });
+      pushOwners.push(null);
     }
   }
 
@@ -248,7 +254,7 @@ export async function runRound() {
     );
   }
 
-  // 记账（摘要算每个用户交付了几条）
+  // 记账 + 把摘要回填到各自的推送任务
   for (const plan of plans) {
     const used = plan.summaries.size;
     if (!used) continue;
@@ -257,87 +263,47 @@ export async function runRound() {
     const models = [...new Set([...plan.summaries.values()].map((s) => s.model))];
     log.info("ai", `用户 ${plan.uid} 生成 ${used}/${plan.targets} 条摘要（${models.join("、")}）`);
   }
-
-  // ── 5. 组装并发送 ──────────────────────────────────────────────────────
-  // 一个用户本轮的**全部命中合并成尽量少的几条消息**：Telegram 全局约 30 msg/s、
-  // 单聊约 1 msg/s，按帖各发一条的话，命中 10 条就占 10 条配额，还会因单聊限速
-  // 吃 429 再退避重试，把整轮拖长。合并后同一个用户只占 1~3 条。
-  // 只命中 1 条时仍然走原来的单帖消息 —— 常见情况下用户看到的东西一模一样。
-  const sends = [];
-  for (const plan of plans) {
-    const items = plan.usable.map(({ post, matched }) => ({
-      post,
-      matched,
-      summary: plan.summaries.get(post.post_id) || null,
-    }));
-    if (items.length) {
-      const single = items.length === 1 ? items[0] : null;
-      sends.push({
-        uid: plan.uid,
-        items,
-        rich: single
-          ? [buildRichNotifMsg(single.post, single.matched, single.summary)]
-          : buildRichDigests(items, items.length),
-        plain: single
-          ? [buildNotifMsg(single.post, single.matched, single.summary)]
-          : buildPlainDigests(items, items.length),
-      });
-    }
-    if (plan.overflow > 0) {
-      sends.push({
-        uid: plan.uid,
-        overflow: true,
-        items: plan.usable.map((h) => h.post),
-        total: plan.overflow,
-      });
-    }
+  for (let i = 0; i < pushJobs.length; i++) {
+    const owner = pushOwners[i];
+    if (owner) pushJobs[i].summary = owner.plan.summaries.get(owner.post_id) || null;
   }
 
-  // 不同 chat 并行，同一 chat 由 telegram.js 的锁串行（一条消息内也按序发）
+  // ── 5. 并发发送 ────────────────────────────────────────────────────────
+  // 不同 chat 并行，同一 chat 由 telegram.js 的锁串行
   const sendResults = await sendMany(
-    sends.map((s) => ({
+    pushJobs.map((j) => ({
       run: async () => {
-        if (s.overflow) {
-          return { ok: true, r: await sendMessage(s.uid, buildOverflowMsg(s.items, s.total)) };
+        if (j.overflow) {
+          return { ok: true, r: await sendMessage(j.uid, buildOverflowMsg(j.items, j.total)) };
         }
-        let ok = true;
-        for (let i = 0; i < s.rich.length; i++) {
-          if (await sendRichMessage(s.uid, s.rich[i])) continue;
-          // 富文本失败 → 该条降级为经典 HTML（逐条降级，不牵连整批）
-          const r = await sendMessage(s.uid, s.plain[i]);
-          if (r.ok !== true) ok = false;
-        }
-        return { ok };
+        const rich = buildRichNotifMsg(j.post, j.matched, j.summary);
+        const okRich = await sendRichMessage(j.uid, rich);
+        if (okRich) return { ok: true, rich: true };
+        // 富文本失败 → 降级经典 HTML
+        const r = await sendMessage(j.uid, buildNotifMsg(j.post, j.matched, j.summary));
+        return { ok: r.ok === true, rich: false, r };
       },
     }))
   );
 
   // ── 6. 记账写历史 ──────────────────────────────────────────────────────
-  let pushed = 0; // 交付给用户的「帖子」条数 —— 配额口径与合并前完全一致
-  let messages = 0; // 实际发出的消息条数（合并的收益看这个）
-  for (let i = 0; i < sends.length; i++) {
-    const s = sends[i];
+  let pushed = 0;
+  for (let i = 0; i < pushJobs.length; i++) {
+    const j = pushJobs[i];
     const sent = sendResults[i]?.ok === true;
-    if (s.overflow) {
-      if (sent) messages++;
-      continue;
+    if (j.overflow) continue;
+    for (const kw of j.matched.length ? j.matched : ["(none)"]) {
+      logNotification(j.uid, j.post, kw, sent ? "sent" : "failed");
     }
-    for (const it of s.items) {
-      for (const kw of it.matched.length ? it.matched : ["(none)"]) {
-        logNotification(s.uid, it.post, kw, sent ? "sent" : "failed");
-      }
-    }
-    if (sent) {
-      pushed += s.items.length;
-      messages += s.rich.length;
-    }
+    if (sent) pushed++;
   }
-  // 按用户汇总推送数（按帖子算）并一次性写用量
+  // 按用户汇总推送数并一次性写用量
   const perUserPushed = new Map();
-  for (let i = 0; i < sends.length; i++) {
-    const s = sends[i];
-    if (s.overflow || !sendResults[i]?.ok) continue;
-    perUserPushed.set(s.uid, (perUserPushed.get(s.uid) || 0) + s.items.length);
+  for (let i = 0; i < pushJobs.length; i++) {
+    if (pushJobs[i].overflow) continue;
+    if (sendResults[i]?.ok) {
+      perUserPushed.set(pushJobs[i].uid, (perUserPushed.get(pushJobs[i].uid) || 0) + 1);
+    }
   }
   for (const [uid, n] of perUserPushed) incrUsage(uid, "pushes", n);
 
@@ -346,8 +312,7 @@ export async function runRound() {
   stats.lastDurationMs = Date.now() - started;
   log.info(
     "poller",
-    `本轮完成：${posts.length} 帖 / ${users.length} 用户 / 推送 ${pushed} 条（${messages} 条消息）/ ` +
-      `摘要 ${stats.lastAiCalls} 条 / 耗时 ${stats.lastDurationMs}ms`
+    `本轮完成：${posts.length} 帖 / ${users.length} 用户 / 推送 ${pushed} 条 / 摘要 ${stats.lastAiCalls} 条 / 耗时 ${stats.lastDurationMs}ms`
   );
 
   return {
