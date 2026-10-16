@@ -20,3 +20,6 @@ data/
 .idea/
 .vscode/
 *.swp
+
+# 基准测试的数据与临时备份（体积大，不入库）
+.bench/

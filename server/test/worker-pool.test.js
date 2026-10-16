@@ -90,8 +90,40 @@ test("线程池：超时保护会终止并重建 worker", async () => {
   // 不管成败，池都必须自我修复且仍能服务后续任务
   await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, config.workerTaskTimeoutMs + 3000))]);
   await new Promise((r) => setTimeout(r, 300));
-  assert.ok(pool.stats().alive > 0, `池应仍存活（超时前 ${before}，现在 ${pool.stats().alive}）`);
+  // 这里必须断言「恢复到原样」而不是「大于 0」：
+  // 只判存活时，池少一个线程照样通过 —— 这正是下面那个退化 bug 藏身之处。
+  assert.equal(
+    pool.stats().alive,
+    before,
+    `池应恢复到超时前的线程数（超时前 ${before}，现在 ${pool.stats().alive}）`
+  );
 
   const ok = await pool.run("parse", { xml: makeRss([{ id: 999, title: "恢复检查" }]), sourceIndex: 0 });
   assert.equal(ok[0].post_id, 999, "重建后仍应能正常处理任务");
+});
+
+test("线程池：连续多次超时后，线程数与空闲队列都不得退化", async () => {
+  const { Pool } = await import("../src/worker-pool.js");
+  // 用独立的小池子，把超时压到 200ms，以便确定性复现「回收」路径
+  const p = new Pool(4, 200);
+  try {
+    assert.equal(p.stats().alive, 4, "初始应有 4 个线程");
+    for (let i = 1; i <= 3; i++) {
+      // (a+)+b 配一长串 a：灾难性回溯，必然超时 —— 正是超时保护要挡的攻击形态
+      await assert.rejects(
+        p.run("match", {
+          posts: [{ post_id: 1, title: "a".repeat(40_000), category: "daily", source: 0 }],
+          keywords: [{ keyword: "(a+)+b", category: null, match_mode: "regex" }],
+        }),
+        /计算超时/
+      );
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(p.stats().alive, 4, `第 ${i} 次超时后线程数应仍为 4（实际 ${p.stats().alive}）`);
+      assert.equal(p.stats().idle, 4, `第 ${i} 次超时后空闲队列不应膨胀（实际 ${p.stats().idle}）`);
+    }
+    const ok = await p.run("parse", { xml: makeRss([{ id: 999, title: "恢复检查" }]), sourceIndex: 0 });
+    assert.equal(ok[0].post_id, 999, "多次超时后仍应能正常处理任务");
+  } finally {
+    await p.close();
+  }
 });

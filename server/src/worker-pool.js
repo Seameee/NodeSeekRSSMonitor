@@ -21,11 +21,15 @@ import { matchPost } from "./match.js";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TASK_ENTRY = join(__dirname, "worker-task.js");
 
-class Pool {
+export class Pool {
   constructor(size, taskTimeoutMs) {
     this.size = size;
     this.taskTimeoutMs = taskTimeoutMs;
-    this.workers = [];
+    // workers 必须是**集合**而不是按索引写的数组：
+    // 回收时会把死 worker 从中间摘掉，而数组一旦被 filter 压缩，索引含义就变了，
+    // 再按 _index 写回就会覆盖掉另一个还活着的 worker —— 表现为
+    // 「超时一次就永久少一个线程、空闲队列还越涨越多」。
+    this.workers = new Set();
     this.idle = [];
     this.queue = [];
     this.seq = 0;
@@ -36,6 +40,7 @@ class Pool {
   }
 
   #spawn(index) {
+    if (this.disabled) return;
     let worker;
     try {
       worker = new Worker(TASK_ENTRY);
@@ -46,27 +51,31 @@ class Pool {
     }
     worker._index = index;
     worker._busy = null; // 当前任务
+    worker._dead = false; // 已被回收处理过，用于 error/exit 的幂等
     worker.on("message", (msg) => this.#onDone(worker, null, msg));
     worker.on("error", (err) => {
       log.error("pool", `worker#${index} 错误: ${err.message}`);
       this.#recycle(worker, new Error(err.message));
     });
     worker.on("exit", (code) => {
-      // 被 terminate() 的 worker 走这里；正常不应自己退出
+      // terminate() 过的 worker 会走这里。已被 #recycle 处理过的不许再处理：
+      // 否则一次超时会补两个线程，把池子彻底搞乱。
+      if (worker._dead) return;
       if (worker._busy) {
         log.warn("pool", `worker#${index} 异常退出 (code=${code})，重建`);
         this.#recycle(worker, new Error("worker 意外退出"));
       } else {
-        this.workers = this.workers.filter((w) => w !== worker);
+        this.workers.delete(worker);
         this.idle = this.idle.filter((w) => w !== worker);
-        if (!this.disabled && this.workers.length < this.size) this.#spawn(index);
+        if (!this.disabled && this.workers.size < this.size) this.#spawn(index);
       }
     });
-    this.workers[index] = worker;
+    this.workers.add(worker);
     this.idle.push(worker);
   }
 
   #onDone(worker, err, msg) {
+    if (worker._dead) return; // 已被回收：任务已 reject，不能再回到空闲队列
     const task = worker._busy;
     worker._busy = null;
     if (task) {
@@ -75,25 +84,27 @@ class Pool {
       else if (msg && msg.ok) task.resolve(msg.result);
       else task.reject(new Error(msg?.error || "worker 返回失败"));
     }
-    if (!this.disabled && !this.workers.includes(worker)) return;
+    if (!this.disabled && !this.workers.has(worker)) return;
     if (this.idle.includes(worker)) return;
     this.idle.push(worker);
     this.#drain();
   }
 
-  /** 超时或崩溃后：丢弃该 worker，重建一个替补 */
+  /** 超时或崩溃后：丢弃该 worker，重建一个替补。幂等 —— error 与 exit 可能都触发 */
   #recycle(worker, err) {
+    if (worker._dead) return;
+    worker._dead = true;
     const task = worker._busy;
     worker._busy = null;
     if (task) {
       clearTimeout(task.timer);
       task.reject(err);
     }
-    this.workers = this.workers.filter((w) => w !== worker);
+    this.workers.delete(worker);
     this.idle = this.idle.filter((w) => w !== worker);
     worker.terminate().catch(() => {});
     if (!this.disabled) {
-      this.#spawn(worker._index ?? this.workers.length);
+      this.#spawn(worker._index ?? 0);
       log.warn("pool", `已重建 worker#${worker._index}（原任务被终止）`);
     }
     this.#drain();
@@ -138,7 +149,7 @@ class Pool {
       disabled: this.disabled,
       idle: this.idle.length,
       queued: this.queue.length,
-      alive: this.workers.filter(Boolean).length,
+      alive: this.workers.size,
     };
   }
 
@@ -148,8 +159,10 @@ class Pool {
       clearTimeout(t.timer);
       t.reject(new Error("线程池关闭"));
     });
-    await Promise.all(this.workers.filter(Boolean).map((w) => w.terminate().catch(() => {})));
-    this.workers = [];
+    const all = [...this.workers];
+    for (const w of all) w._dead = true; // 阻止 exit 处理器再补线程
+    await Promise.all(all.map((w) => w.terminate().catch(() => {})));
+    this.workers.clear();
     this.idle = [];
   }
 }
