@@ -459,6 +459,39 @@ function normalizePost(p) {
   return { post_id: p.post_id, source: p.source ?? 0 };
 }
 
+let legacyTableExists = null;
+
+/**
+ * 升级垫片：老库有 seen_posts 但没有水位线。
+ *
+ * 不做这一步的话，升级后的**第一轮**会把整个 feed 当成全新帖子 —— 每个老用户
+ * 都会被推最多 MAX_PER_USER_PER_ROUND 条。单机自用无所谓，但 2000 用户的部署
+ * 会在一轮里涌出上万条推送，把几十分钟的发送配额一次性吃光。
+ *
+ * 按需做而不是启动时全量做：`MAX(post_id) WHERE telegram_id=?` 走主键索引，
+ * 单次 O(log n)，只对「还没有水位线」的用户各查一次。启动时做全表 GROUP BY
+ * 在 6000 万行的老库上要扫好几秒，会把启动卡住。
+ *
+ * 返回迁移出来的水位线（没有旧数据则返回 null）。
+ */
+function migrateLegacyWatermark(telegramId) {
+  if (legacyTableExists === null) {
+    legacyTableExists = !!prep(
+      "SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='seen_posts'"
+    ).get();
+  }
+  if (!legacyTableExists) return null;
+  const m = prep("SELECT MAX(post_id) AS m FROM seen_posts WHERE telegram_id=?").get(telegramId)?.m;
+  if (m === null || m === undefined) return null;
+  // 旧数据没记来源，只能当主源处理（实际也几乎总是主源）
+  prep(
+    `INSERT INTO seen_state (telegram_id,source,max_post_id,updated_at) VALUES (?,?,?,?)
+     ON CONFLICT(telegram_id,source) DO NOTHING`
+  ).run(telegramId, 0, m, now());
+  log.debug("db", `用户 ${telegramId} 的水位线由旧 seen_posts 迁移：max_post_id=${m}`);
+  return m;
+}
+
 /** 一次查出某用户已看过的帖子 ID 集合 */
 export function filterUnseen(telegramId, posts) {
   const seen = new Set();
@@ -466,6 +499,10 @@ export function filterUnseen(telegramId, posts) {
   const marks = new Map();
   for (const r of prep("SELECT source,max_post_id FROM seen_state WHERE telegram_id=?").all(telegramId)) {
     marks.set(r.source, r.max_post_id);
+  }
+  if (!marks.size) {
+    const seeded = migrateLegacyWatermark(telegramId);
+    if (seeded !== null) marks.set(0, seeded);
   }
   if (!marks.size) return seen;
   for (const raw of posts) {

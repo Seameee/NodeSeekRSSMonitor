@@ -113,6 +113,48 @@ test("端到端：新帖会推，旧帖重现不会重推", async () => {
   assert.match(msgs[0].html, /新到的货/, "推的应是新帖而不是旧帖");
 });
 
+test("升级垫片：老库没有水位线时，用旧 seen_posts 的最大 id 初始化，避免升级后集体重推", () => {
+  const uid = freshUser(8101);
+  const ins = db.db.prepare(
+    "INSERT OR IGNORE INTO seen_posts (telegram_id,post_id,seen_at) VALUES (?,?,?)"
+  );
+  const ts = new Date().toISOString();
+  for (const id of [800_001, 800_050, 800_030]) ins.run(uid, id, ts);
+  assert.equal(stateRows(uid), 0, "准备阶段该用户还没有水位线");
+
+  // 第一次查已见时就地迁移：feed 里那些 ≤800050 的帖子必须算已见
+  assert.equal(
+    db.filterUnseen(uid, [
+      { post_id: 800_010, source: 0 },
+      { post_id: 800_050, source: 0 },
+    ]).size,
+    2,
+    "旧表里的最大 id 应成为初始水位线"
+  );
+  assert.equal(stateRows(uid), 1, "迁移后应正好留下 1 行水位线");
+  assert.equal(db.filterUnseen(uid, [{ post_id: 800_051, source: 0 }]).size, 0, "比水位线新的仍算新帖");
+});
+
+test("升级垫片：已有水位线时不再回头看旧表", () => {
+  const uid = freshUser(8102);
+  db.markSeen(uid, [{ post_id: 10, source: 0 }]);
+  const ins = db.db.prepare(
+    "INSERT OR IGNORE INTO seen_posts (telegram_id,post_id,seen_at) VALUES (?,?,?)"
+  );
+  ins.run(uid, 999_999, new Date().toISOString());
+
+  assert.equal(
+    db.filterUnseen(uid, [{ post_id: 10, source: 0 }]).size,
+    1,
+    "应继续用已有水位线（10），不能被旧表里更大的 id 顶掉"
+  );
+  assert.equal(
+    db.filterUnseen(uid, [{ post_id: 500, source: 0 }]).size,
+    0,
+    "水位线仍是 10，500 应为新帖"
+  );
+});
+
 test("遗留表：purge 分批清空 seen_posts，且受时间预算约束", () => {
   const rowsBefore = db.db.prepare("SELECT COUNT(*) AS n FROM seen_posts").get().n;
   const ins = db.db.prepare(
