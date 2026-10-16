@@ -146,3 +146,24 @@ test("F1c：未配白名单时，首个 /bind 仍照常认领（保留原有行�
 
   db.resetMultiUserEnabled();
 });
+
+test("提权：被封禁的账号即使还在白名单里，也不得使用 /admin", async () => {
+  // 场景：先封禁一个普通用户，之后运维把他加进 ADMIN_TELEGRAM_IDS。
+  // 修复前 /admin 的鉴权早于封禁检查，他会带着 banned 状态拿到管理面板。
+  const uid = 8301;
+  db.deleteUser(uid);
+  db.createUser({ telegramId: uid, username: "banned" });
+  db.setUserStatus(uid, "banned");
+  config.adminIds.add(uid);
+
+  assert.equal(db.isAdminUser(db.getUser(uid)), true, "前置：白名单让他看起来是管理员");
+
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/admin stats", { id: uid }));
+  const last = sent.at(-1)?.html || "";
+  assert.match(last, /已被封禁/, "封禁应优先于管理员权限");
+  assert.doesNotMatch(last, /全局统计/, "不得进入管理面板");
+
+  config.adminIds.delete(uid);
+  db.deleteUser(uid);
+});

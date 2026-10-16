@@ -186,6 +186,23 @@ export async function handleUpdate(update) {
     return true;
   }
 
+  // ── 封禁 / 状态检查（必须排在 /admin 之前）──────────────────────────────
+  // 封禁是最强的否定信号，必须能覆盖一切提权来源。若放在 /admin 之后，一个
+  // 被封禁的账号只要还在 ADMIN_TELEGRAM_IDS 白名单里（例如先封禁、后补白名单），
+  // 就仍能进入管理面板。
+  if (registered) {
+    const usableEarly = checkUsable(registered);
+    if (!usableEarly.ok) {
+      await reply(
+        chatId,
+        usableEarly.reason === "banned"
+          ? "🚫 你的账号已被封禁。"
+          : `账号状态异常（${usableEarly.reason}），请联系管理员。`
+      );
+      return true;
+    }
+  }
+
   // ── 管理员 ─────────────────────────────────────────────────────────────
   if (cmd === "/admin") {
     if (!isAdminUser(registered)) {
@@ -220,16 +237,6 @@ export async function handleUpdate(update) {
       return true;
     }
     await reply(chatId, "请先发送 /bind 开通账号。");
-    return true;
-  }
-
-  const usable = checkUsable(registered);
-  if (!usable.ok) {
-    if (usable.reason === "banned") {
-      await reply(chatId, "🚫 你的账号已被封禁。");
-    } else {
-      await reply(chatId, `账号状态异常（${usable.reason}），请联系管理员。`);
-    }
     return true;
   }
 
