@@ -281,3 +281,16 @@ test("推送：单用户模式下不向非管理员推送，但其数据保留",
 
   db.setMultiUserEnabled(true); // 还原，避免影响后续用例
 });
+
+test("worker 池默认值：按容器可用 CPU 取值（不能用 os.cpus，它报的是宿主机核数）", async () => {
+  const { config } = await import("../src/config.js");
+  const os = await import("node:os");
+  assert.ok(config.cpuCount >= 1, `cpuCount 应为正整数（实际 ${config.cpuCount}）`);
+  if (process.env.WORKER_POOL_SIZE) return; // 显式配置时不校验默认值
+  assert.equal(
+    config.workerPoolSize,
+    Math.max(2, Math.min(4, config.cpuCount)),
+    `默认池子大小应 = max(2,min(4,可用CPU))（cpuCount=${config.cpuCount}）`
+  );
+  assert.ok(config.cpuCount <= os.cpus().length, "可用 CPU 不应超过宿主机核数");
+});

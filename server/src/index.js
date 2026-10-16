@@ -32,7 +32,8 @@ function printBanner() {
   log.info("boot", `轮询间隔   : ${config.pollIntervalMs}ms`);
   log.info(
     "boot",
-    `worker 池  : ${config.workerPoolSize > 0 ? `${config.workerPoolSize} 线程` : "已禁用"}`
+    `worker 池  : ${config.workerPoolSize > 0 ? `${config.workerPoolSize} 线程` : "已禁用"}` +
+      `（可用 CPU ${config.cpuCount}）`
   );
   log.info("boot", `AI 并发    : ${config.aiConcurrency}`);
   log.info("boot", `发送并发   : ${config.sendConcurrency}（${config.sendRatePerSec} 条/秒）`);

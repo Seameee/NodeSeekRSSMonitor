@@ -35,6 +35,13 @@ function listEnv(name) {
 
 const isProd = process.env.NODE_ENV === "production";
 
+// 容器里 os.cpus() 报的是**宿主机**的核数，不是本容器能用的核数：
+// docker-compose 把本服务限制成 cpus=1.0，而池子按宿主 4 核开了 4 个线程，
+// 结果是 4 个 worker 抢 1 个 CPU 配额（实测同一负载 12 核机 452ms、1 核容器 3180ms）。
+// availableParallelism() 会考虑 cgroup 限额与 CPU 亲和性，才是在容器里该用的数。
+const cpuCount =
+  typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
+
 // ─── 必填项 ──────────────────────────────────────────────────────────────────
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
 if (!TELEGRAM_BOT_TOKEN) {
@@ -87,7 +94,8 @@ export const config = {
 
   // 并发控制：这是多用户下最关键的性能旋钮
   // CPU 密集任务（XML 解析 + 关键词正则匹配）放进 worker 线程池
-  workerPoolSize: intEnv("WORKER_POOL_SIZE", Math.max(2, Math.min(4, os.cpus().length)), {
+  cpuCount,
+  workerPoolSize: intEnv("WORKER_POOL_SIZE", Math.max(2, Math.min(4, cpuCount)), {
     min: 0, // 0 = 禁用 worker，退化为进程内计算
     max: 16,
   }),

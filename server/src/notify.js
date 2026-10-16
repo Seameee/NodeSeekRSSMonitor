@@ -73,6 +73,82 @@ export function buildOverflowMsg(items, total) {
   );
 }
 
+// ─── 一轮多条命中的合并消息 ──────────────────────────────────────────────────
+//
+// 为什么要合并：Telegram 全局约 30 msg/s、**单聊约 1 msg/s**，而发送是整轮里
+// 唯一躲不掉的串行瓶颈（实测 20 条/秒，200 条要 9.9 秒）。按帖发一条的话，
+// 一个用户命中 10 条就占掉 10 条配额，还可能因为单聊 1 msg/s 被 429、再退避重试
+// 把整轮拖长。合并后同一个用户无论命中几条都只占 1~3 条。
+//
+// 单条命中时**仍然走原来的单帖消息**（格式与合并前逐字节一致），
+// 所以绝大多数用户看到的东西没有任何变化。
+
+/** 单条消息的长度上限：Telegram 是 4096，留出标签与包装的余量 */
+const MAX_MSG_LEN = 3500;
+const DIGEST_SEP = "\n\n────────────\n\n";
+
+/** 合并模式下把单条压到可控长度，保证一条消息里能塞下几条、且不会超长 */
+function trimItem(it) {
+  return {
+    post: { ...it.post, title: String(it.post?.title || "").slice(0, 160) },
+    matched: (it.matched || []).map((k) => String(k).slice(0, 60)).slice(0, 8),
+    summary: it.summary
+      ? { ...it.summary, text: String(it.summary.text || "").slice(0, 300) }
+      : null,
+  };
+}
+
+/**
+ * 按整条帖子分块，绝不从中间切开某个帖子的 HTML
+ * （标签被切开会让 Telegram 直接 400 拒收整条消息）。
+ */
+function chunkItems(items, header, limit, render) {
+  const out = [];
+  let cur = "";
+  for (const it of items) {
+    const block = render(it);
+    if (!cur) {
+      cur = `${header}\n\n${block}`;
+    } else if (cur.length + DIGEST_SEP.length + block.length <= limit) {
+      cur += DIGEST_SEP + block;
+    } else {
+      out.push(cur);
+      cur = `${header}\n\n${block}`;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** 富文本合并消息：一批命中合成尽量少的几条 */
+export function buildRichDigests(items, total = items.length) {
+  const header = `🔔 <b>本轮命中 ${total} 条</b>`;
+  return chunkItems(items, header, MAX_MSG_LEN, (raw) => {
+    const it = trimItem(raw);
+    return buildRichNotifMsg(it.post, it.matched, it.summary);
+  });
+}
+
+/** 合并消息里单条帖子的经典 HTML 正文（不含整条消息的表头） */
+function plainItem(post, matched = [], summary = null) {
+  const cn = CATEGORIES[post.category] || post.category || "未知";
+  const kwText = matched.join("\n");
+  let s = `📌 <b>${esc(post.title)}</b>\n`;
+  if (kwText) s += `<blockquote expandable><code>${esc(kwText)}</code></blockquote>\n`;
+  if (summary?.text) s += `📝 <i>${esc(summary.model)}</i>\n<blockquote>${esc(summary.text)}</blockquote>\n`;
+  s += `🏷 ${esc(cn)}\n👤 ${esc(post.author || "未知")}\n🔗 ${post.link}`;
+  return s;
+}
+
+/** 经典 HTML 合并消息（富文本不可用时的降级） */
+export function buildPlainDigests(items, total = items.length) {
+  const header = `🔔 <b>关键词提醒：本轮命中 ${total} 条</b>`;
+  return chunkItems(items, header, MAX_MSG_LEN, (raw) => {
+    const it = trimItem(raw);
+    return plainItem(it.post, it.matched, it.summary);
+  });
+}
+
 /** 统一的帮助文本（管理员会多出一段） */
 import { USER_HELP_SECTIONS, ADMIN_HELP_ITEMS, renderItems } from "./help.js";
 
