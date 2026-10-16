@@ -131,7 +131,7 @@ export async function runRound() {
     // 没有关键词就不推送 —— 这是明确的产品约定
     if (!keywords.length) return null;
 
-    const seen = filterUnseen(uid, posts.map((p) => p.post_id));
+    const seen = filterUnseen(uid, posts);
     const fresh = posts.filter((p) => !seen.has(p.post_id));
     if (!fresh.length) return null;
 
@@ -139,8 +139,7 @@ export async function runRound() {
     const hitIds = matches.filter((m) => m.matched.length).map((m) => m.post_id);
 
     // 未命中的帖子也要标记已见，否则每轮都会重复计算
-    const consumed = fresh.map((p) => p.post_id);
-    markSeen(uid, consumed);
+    markSeen(uid, fresh);
 
     if (!hitIds.length) return null;
 

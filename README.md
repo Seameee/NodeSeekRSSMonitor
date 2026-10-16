@@ -409,9 +409,13 @@ compose 里默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件�
 
 - WAL 模式，读写不互斥，轮询写库不阻塞用户命令
 - 预编译语句缓存，避免重复编译
-- 索引覆盖热路径：`seen_posts(telegram_id,seen_at)`、`keywords(telegram_id,enabled)`、`notifications(telegram_id,sent_at)`
+- 索引覆盖热路径：`keywords(telegram_id,enabled)`、`notifications(telegram_id,sent_at)`
 - 关键词列表按修订号缓存，改动时才失效
-- 已见帖子批量查询与写入，一轮一次往返
+- **已见记录用水位线**（`seen_state`）：每个「用户 × 源」只存一行「见过的最大 post_id」。帖子号随发帖时间严格递增，所以「id ≤ 水位线」等价于「已见过」。
+
+  旧实现是「每用户 × 每帖一行」，实测 NodeSeek 约 2.8 帖/分钟，2000 用户 7 天要涨到 **约 6000 万行 / 6 GiB**，而 RSS 只暴露最新约 20 条 —— 绝大多数行永远不会被查到；每小时的清理还是一次全表扫描（490 万行实测 6.9 秒，且跑在主线程上，期间 bot 不响应命令）。改水位线后是 **2000 行 / 0.3 MiB 恒定**，`filterUnseen` 2000 用户 13 ms、`markSeen` 58 ms，且不再有任何按时间清理。
+
+  升级时旧表 `seen_posts` 不会被读取，但历史数据仍在磁盘上占地方。服务会在每小时维护里**分批**清空它（实测约 8 万行/秒，每次受 `LEGACY_SEEN_PURGE_MS` 时间预算约束，避免卡住主线程）。6000 万行大约需要 20 天排完；想立刻拿回空间请重建数据卷（`docker compose down -v`）。
 
 ### 数据与备份
 

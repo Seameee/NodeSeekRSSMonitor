@@ -128,7 +128,11 @@ export const config = {
   maxHistoryRows: intEnv("MAX_HISTORY_ROWS", 20, { min: 1, max: 100 }),
 
   // 数据保留
+  // seenRetentionDays 自 2026-10-16 起已废弃：已见记录改用水位线（一行一个源），
+  // 不再按时间清理。保留这个键只是为了避免删掉环境变量时让人以为配错了。
   seenRetentionDays: intEnv("SEEN_RETENTION_DAYS", 7, { min: 1, max: 365 }),
+  // 每次维护最多花多少毫秒清空遗留的 seen_posts（旧方案留下的历史数据）
+  legacySeenPurgeMs: intEnv("LEGACY_SEEN_PURGE_MS", 1_500, { min: 0, max: 30_000 }),
   notifRetentionDays: intEnv("NOTIF_RETENTION_DAYS", 30, { min: 1, max: 3650 }),
   usageRetentionDays: intEnv("USAGE_RETENTION_DAYS", 90, { min: 1, max: 3650 }),
   cleanupIntervalMs: intEnv("CLEANUP_INTERVAL_MS", 3_600_000, { min: 60_000, max: 86_400_000 }),

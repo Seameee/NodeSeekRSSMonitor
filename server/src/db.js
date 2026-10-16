@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS ai_configs (
   updated_at    TEXT    NOT NULL
 );
 
+-- 【遗留，只读不再写】旧的已见方案：每用户 × 每帖一行。
+-- 2000 用户 7 天会涨到约 6000 万行 / 6 GiB，而 RSS 只暴露最新约 20 条 ——
+-- 绝大多数行永远不会被查到。已由 seen_state 取代，这里只保留表以便分批清空。
 CREATE TABLE IF NOT EXISTS seen_posts (
   telegram_id INTEGER NOT NULL,
   post_id     INTEGER NOT NULL,
@@ -72,6 +75,17 @@ CREATE TABLE IF NOT EXISTS seen_posts (
   PRIMARY KEY (telegram_id, post_id)
 );
 CREATE INDEX IF NOT EXISTS idx_seen_user_time ON seen_posts(telegram_id, seen_at);
+
+-- 已见帖子水位线：每个 (用户, 源) 只记「见过的最大 post_id」。
+-- post_id 与发帖时间同序且只增（NodeSeek 用帖子号，TG 镜像用消息号），
+-- 所以「id ≤ 水位线」等价于「已经见过」，一行代替几万行。
+CREATE TABLE IF NOT EXISTS seen_state (
+  telegram_id INTEGER NOT NULL,
+  source      INTEGER NOT NULL,
+  max_post_id INTEGER NOT NULL,
+  updated_at  TEXT    NOT NULL,
+  PRIMARY KEY (telegram_id, source)
+);
 
 CREATE TABLE IF NOT EXISTS notifications (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,7 +246,7 @@ export function setUserNote(telegramId, note) {
 export function deleteUser(telegramId) {
   db.exec("BEGIN");
   try {
-    for (const t of ["keywords", "ai_configs", "seen_posts", "notifications", "usage_daily"]) {
+    for (const t of ["keywords", "ai_configs", "seen_state", "seen_posts", "notifications", "usage_daily"]) {
       prep(`DELETE FROM ${t} WHERE telegram_id=?`).run(telegramId);
     }
     // 关键词修订号必须一并清掉：否则同一个 Telegram ID 重新 /bind 后，
@@ -429,31 +443,60 @@ export function listEnabledAiConfigs() {
   ).all();
 }
 
-// ─── 已见帖子 ────────────────────────────────────────────────────────────────
+// ─── 已见帖子（水位线） ──────────────────────────────────────────────────────
+//
+// 语义：某 (用户, 源) 见过 post_id ≤ max_post_id 的全部帖子。
+// 每轮 markSeen 会把本轮**所有**帖子（含未命中的）的最高 id 记进去 —— 与旧方案
+// 「把本轮所有帖子都标记已见」完全一致，因此不会因为换实现而重复推送或漏推。
+//
+// 之所以能这么省：NodeSeek 的 post_id 就是帖子号，随发帖时间严格递增
+// （实测一屏 20 条 987476→987495，且与 pubDate 同序）；TG 镜像源用消息号，同样
+// 递增。新帖不可能拿到比已有帖子更小的号，所以一个水位线就够。
+
+/** 只接受 { post_id, source }；数字视为 source=0（测试与旧调用方便） */
+function normalizePost(p) {
+  if (typeof p === "number") return { post_id: p, source: 0 };
+  return { post_id: p.post_id, source: p.source ?? 0 };
+}
 
 /** 一次查出某用户已看过的帖子 ID 集合 */
-export function filterUnseen(telegramId, postIds) {
+export function filterUnseen(telegramId, posts) {
   const seen = new Set();
-  if (!postIds.length) return seen;
-  // SQLite 变量上限较高，但保守按 400 分批
-  for (let i = 0; i < postIds.length; i += 400) {
-    const chunk = postIds.slice(i, i + 400);
-    const ph = chunk.map(() => "?").join(",");
-    const rows = prep(
-      `SELECT post_id FROM seen_posts WHERE telegram_id=? AND post_id IN (${ph})`
-    ).all(telegramId, ...chunk);
-    for (const r of rows) seen.add(r.post_id);
+  if (!posts.length) return seen;
+  const marks = new Map();
+  for (const r of prep("SELECT source,max_post_id FROM seen_state WHERE telegram_id=?").all(telegramId)) {
+    marks.set(r.source, r.max_post_id);
+  }
+  if (!marks.size) return seen;
+  for (const raw of posts) {
+    const { post_id, source } = normalizePost(raw);
+    const mark = marks.get(source);
+    if (mark !== undefined && post_id <= mark) seen.add(post_id);
   }
   return seen;
 }
 
-export function markSeen(telegramId, postIds) {
-  if (!postIds.length) return;
+/**
+ * 推进水位线。只取本轮各源的**最高** post_id，并且永不回退
+ * （某条最新帖被删掉时本轮最大值会变小，把水位线调低会让它之后的帖子重新推一遍）。
+ */
+export function markSeen(telegramId, posts) {
+  if (!posts.length) return;
+  const top = new Map();
+  for (const raw of posts) {
+    const { post_id, source } = normalizePost(raw);
+    if (!top.has(source) || post_id > top.get(source)) top.set(source, post_id);
+  }
   const ts = now();
-  const stmt = prep("INSERT OR IGNORE INTO seen_posts (telegram_id,post_id,seen_at) VALUES (?,?,?)");
+  const stmt = prep(
+    `INSERT INTO seen_state (telegram_id,source,max_post_id,updated_at) VALUES (?,?,?,?)
+     ON CONFLICT(telegram_id,source) DO UPDATE SET
+       max_post_id=MAX(seen_state.max_post_id, excluded.max_post_id),
+       updated_at=excluded.updated_at`
+  );
   db.exec("BEGIN");
   try {
-    for (const id of postIds) stmt.run(telegramId, id, ts);
+    for (const [source, id] of top) stmt.run(telegramId, source, id, ts);
     db.exec("COMMIT");
   } catch (e) {
     db.exec("ROLLBACK");
@@ -547,8 +590,36 @@ export function setRssState(url, { etag, lastModified, ok }) {
 
 // ─── 清理 ────────────────────────────────────────────────────────────────────
 
+const legacySeenPurgeStmt = () =>
+  prep("DELETE FROM seen_posts WHERE rowid IN (SELECT rowid FROM seen_posts LIMIT 20000)");
+
+/**
+ * 分批清空遗留的 seen_posts。
+ *
+ * 这张表已经被 seen_state 取代，不再读也不再写；留在这里的历史数据（老部署可能
+ * 有 6000 万行 / 6 GiB）只是占地方。按 rowid 分批删，并且**受时间预算约束** ——
+ * 绝不能变成一次几十秒的全表删除，把主线程（也就是 bot 的响应和长轮询）卡死。
+ * 没删完就留给下一次维护继续，反正是后台数据。
+ *
+ * 注意：SQLite 的文件不会因此缩小（页会被复用）。要立刻拿回磁盘空间，
+ * 只能重建数据卷（docker compose down -v）或手工 VACUUM。
+ */
+export function purgeLegacySeenPosts(budgetMs = config.legacySeenPurgeMs) {
+  if (budgetMs <= 0) return 0;
+  const exists = prep("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name='seen_posts'").get();
+  if (!exists) return 0;
+  const started = Date.now();
+  const stmt = legacySeenPurgeStmt();
+  let removed = 0;
+  while (Date.now() - started < budgetMs) {
+    const n = stmt.run().changes;
+    if (!n) break;
+    removed += n;
+  }
+  return removed;
+}
+
 export function cleanup() {
-  const seenBefore = new Date(Date.now() - config.seenRetentionDays * 86400_000).toISOString();
   const notifBefore = new Date(Date.now() - config.notifRetentionDays * 86400_000).toISOString();
   const usageBefore = new Date(Date.now() - config.usageRetentionDays * 86400_000)
     .toISOString()
@@ -556,7 +627,7 @@ export function cleanup() {
   let removed = 0;
   db.exec("BEGIN");
   try {
-    removed += prep("DELETE FROM seen_posts WHERE seen_at < ?").run(seenBefore).changes;
+    removed += purgeLegacySeenPosts();
     removed += prep("DELETE FROM notifications WHERE sent_at < ?").run(notifBefore).changes;
     removed += prep("DELETE FROM usage_daily WHERE day < ?").run(usageBefore).changes;
     removed += prep("DELETE FROM audit_log WHERE created_at < ?").run(notifBefore).changes;
