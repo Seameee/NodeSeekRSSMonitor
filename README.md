@@ -76,7 +76,7 @@ NodeSeek 论坛关键词监控机器人：轮询 RSS，命中关键词的新帖�
 ### 系统要求
 
 - Docker 20.10+ 与 Docker Compose v2（`docker compose` 命令）
-- 内存 128 MB 起，单核即可支撑数百用户（瓶颈在网络 I/O，不在 CPU）
+- 内存 128 MB 起。默认给容器 **2 核**（`deploy.resources.limits.cpus`）—— 单核时 2 个 worker 线程要和主线程抢同一个核，实测 2000 用户 × 20 关键词的匹配阶段要 3180ms，2 核基本对折。宿主机富余时可调到 `"3.0"`。
 - 能访问 `api.telegram.org` 与 `rss.nodeseek.com` 的网络
 
 ### 快速开始
@@ -136,7 +136,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
+          cpus: "2.0"
           memory: 512M
     logging:
       driver: json-file
@@ -406,9 +406,10 @@ compose 里默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件�
 | 用户间处理 | 分批推进，避免一次性展开所有用户的任务 |
 
 > **worker 线程数按容器可用 CPU 取值**，用 `os.availableParallelism()`（会考虑 cgroup 限额）。
-> 不要用 `os.cpus()` —— 容器里它报的是宿主机核数：本服务被 compose 限制成 `cpus: "1.0"`，
-> 而 4 核宿主机上它会开出 4 个 worker 线程去抢那 1 个 CPU 配额，实测同一负载
-> 12 核机 452ms、1 核容器 3180ms。
+> 不要用 `os.cpus()` —— cgroup 的 CPU 限额**不会**让它变小：容器里它照样报宿主机核数。
+> 例如在 4 核宿主机上把容器限成 `cpus: "1.0"`，`os.cpus()` 仍报 4，于是池子开出
+> 4 个 worker 线程去抢那 1 个 CPU 配额 —— 实测同一负载 12 核机 452ms、1 核容器 3180ms。
+> `cpus` 调大后线程数会自动跟着涨（当前默认 `"2.0"`）。
 
 **数据库**
 

@@ -60,11 +60,20 @@ services:
       - /tmp:size=16m,mode=1777
 
     # ── 资源限制 ──────────────────────────────────────────────────────────
-    # 单核 + 512MB 足以支撑数百用户（瓶颈在网络 I/O，不在 CPU）
+    # 2 核：这个上限是**容器能用的 CPU 数**，池子大小（WORKER_POOL_SIZE）会按
+    # os.availableParallelism() 自动跟着它走。
+    #
+    # 原来是 "1.0"。单核时 2 个 worker 线程要和主线程抢同一个核，实测 2000 用户
+    # × 20 关键词的匹配阶段要 3180ms（12 核机上 452ms）。给到 2 核后 worker 与
+    # 主线程各有着落，这一项基本对折。
+    #
+    # 注意：cpus 是 cgroup 配额，不会让 os.cpus() 变小 —— 它照样报宿主机核数，
+    # 所以千万别用 os.cpus() 去配线程数（见 config.js 里的说明）。
+    # 宿主机是 4 核但还跑着其它容器，别直接给满；要再快可调到 "3.0"。
     deploy:
       resources:
         limits:
-          cpus: "1.0"
+          cpus: "2.0"
           memory: 512M
         reservations:
           memory: 128M
