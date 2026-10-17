@@ -124,12 +124,18 @@ export async function sendMessage(chatId, text, opts = {}) {
 /**
  * 发富文本消息。返回 true 表示成功；失败交由调用方降级为 sendMessage。
  *
- * 刻意不重试：这条路径本身就有经典 HTML 兜底，重试只会白等退避时间
- * 并占用全局限流额度。失败一次立刻让上层降级，用户更快拿到通知。
+ * **必须重试**。这里原来是 retries: 0，理由是「反正有经典 HTML 兜底」—— 但兜底
+ * 是**用户看得见**的降级：卡片式标题没了、链接不再是按钮，整条消息退回旧版式。
+ * 而失败原因绝大多数是网络瞬断（实测日志：`sendRichMessage 最终失败: fetch
+ * failed`，一天出现 3 次），这种情况重试就能成功。
+ *
+ * 策略：网络错误与 5xx 走 tg 的指数退避（retries: 2，最多多等约 1.5 秒）；
+ * 4xx（正文确实不合法，重试无意义）在 tg 内部直接返回、不重试，于是仍然降级。
+ * 即：**内容被拒才降级，网络抖动不降级**。
  */
 export async function sendRichMessage(chatId, html) {
   return withChatLock(chatId, async () => {
-    const r = await tg("sendRichMessage", { chat_id: chatId, rich_message: { html } }, { retries: 0 });
+    const r = await tg("sendRichMessage", { chat_id: chatId, rich_message: { html } }, { retries: 2 });
     return r.ok === true;
   });
 }

@@ -279,7 +279,10 @@ export async function runRound() {
         const rich = buildRichNotifMsg(j.post, j.matched, j.summary);
         const okRich = await sendRichMessage(j.uid, rich);
         if (okRich) return { ok: true, rich: true };
-        // 富文本失败 → 降级经典 HTML
+        // 富文本最终失败（网络重试完仍不通，或正文被 Telegram 拒收）→ 降级经典 HTML。
+        // 一定要留痕：降级是用户看得见的版式变化，此前只有 tg 层的报错、
+        // 定位问题要靠猜（曾误以为是格式写错）。
+        log.warn("push", `用户 ${j.uid} 富文本发送失败，本条降级为经典格式`);
         const r = await sendMessage(j.uid, buildNotifMsg(j.post, j.matched, j.summary));
         return { ok: r.ok === true, rich: false, r };
       },
