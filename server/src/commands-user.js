@@ -132,46 +132,204 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-async function cmdRemove(ctx, rest) {
-  const { user, chatId } = ctx;
-  const arg = rest.trim();
-  if (!arg) return reply(chatId, `${no} 用法：<code>/remove &lt;序号|关键词&gt;</code>`);
+// ─── 批量选择（/remove、/pause、/resume 共用）────────────────────────────────
+//
+// 为什么要支持批量：单用户上限就是 20 条，而实际用起来一条往往是几百字符的
+// 品牌名正则（`^(?!.*收).*(家人|佳人|bitsflow|…)`）。逐条操作要发 20 次命令，
+// 纯粹是操作成本，与功能无关。
+//
+// 支持的写法，且可以混用：
+//   序号：3 / 3 5 7 / 3,5,7 / 1-5
+//   all ：全部关键词（/remove 需二次确认）
+//   关键词：精确匹配、不区分大小写
 
-  const kws = listKeywords(user.telegram_id);
-  let target = null;
-  if (/^\d+$/.test(arg)) {
-    const idx = Number.parseInt(arg, 10);
-    target = kws[idx - 1] || null;
-    if (!target) return reply(chatId, `${no} 序号 ${idx} 不存在（共 ${kws.length} 条）`);
-  } else {
-    target = kws.find((k) => k.keyword.toLowerCase() === arg.toLowerCase()) || null;
-    if (!target) return reply(chatId, `${no} 未找到关键词 <code>${escapeHtml(arg)}</code>`);
+/** 确认词：/remove all confirm */
+const BULK_CONFIRM = new Set(["confirm", "确认", "-y", "--yes"]);
+
+/** 结果消息里单条关键词最多显示多少字符（正则动辄几百字符，全列会刷屏） */
+const KW_DISPLAY_MAX = 60;
+/** 结果消息里最多列多少条，其余折叠 */
+const KW_LIST_MAX = 10;
+
+function shortKw(s) {
+  const t = String(s);
+  return t.length > KW_DISPLAY_MAX ? `${t.slice(0, KW_DISPLAY_MAX)}…` : t;
+}
+
+/** 结果列表里的一行 */
+function kwLine(k) {
+  const mode = k.match_mode === "regex" ? " ·正则" : "";
+  const cat = k.category ? ` ·${k.category}` : "";
+  return `· <code>${escapeHtml(shortKw(k.keyword))}</code>${mode}${cat}`;
+}
+
+/** 未处理项的提示（最多列 5 项，避免刷屏） */
+function problemsLine(problems) {
+  if (!problems.length) return "";
+  const shown = problems.slice(0, 5).join("、");
+  const more = problems.length > 5 ? ` 等 ${problems.length} 项` : "";
+  return `\n\n${no} 未处理：${shown}${more}`;
+}
+
+/**
+ * 把选择器解析成关键词行数组。
+ *
+ * 关键点：**先解析成 id，再执行删除**。若边删边按序号取，删掉第 1 条后原第 2
+ * 条就变成了第 1 条，`/remove 1 2` 会误删错的东西。
+ *
+ * 返回 { all?: true, picked: [], problems: [], confirmed, empty? }
+ */
+function parseBulkSelector(rest, kws) {
+  const tokens = String(rest || "")
+    .trim()
+    .split(/[\s,，、]+/)
+    .filter(Boolean);
+
+  let confirmed = false;
+  const kept = [];
+  for (const t of tokens) {
+    if (BULK_CONFIRM.has(t.toLowerCase())) confirmed = true;
+    else kept.push(t);
+  }
+  if (!kept.length) return { picked: [], problems: [], confirmed, empty: true };
+
+  if (kept.some((t) => t.toLowerCase() === "all")) {
+    if (kept.length > 1) {
+      return { picked: [], problems: ["all 不能和其它序号或关键词混用"], confirmed };
+    }
+    return { all: true, picked: kws.slice(), problems: [], confirmed };
   }
 
-  removeKeywordById(user.telegram_id, target.id);
-  bumpKeywordRevision(user.telegram_id);
-  return reply(chatId, `${ok} 已删除 <code>${escapeHtml(target.keyword)}</code>`);
+  const byId = new Map();
+  const problems = [];
+  for (const t of kept) {
+    const range = /^(\d+)\s*[-~～]\s*(\d+)$/.exec(t);
+    if (range) {
+      const a = Number.parseInt(range[1], 10);
+      const b = Number.parseInt(range[2], 10);
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      if (hi > kws.length) problems.push(`范围 ${t} 超出当前 ${kws.length} 条`);
+      for (let i = lo; i <= Math.min(hi, kws.length); i++) {
+        const kw = kws[i - 1];
+        if (kw) byId.set(kw.id, kw);
+      }
+      continue;
+    }
+    if (/^\d+$/.test(t)) {
+      const i = Number.parseInt(t, 10);
+      const kw = kws[i - 1];
+      if (kw) byId.set(kw.id, kw);
+      else problems.push(`序号 ${i} 不存在（共 ${kws.length} 条）`);
+      continue;
+    }
+    const hit = kws.find((k) => k.keyword.toLowerCase() === t.toLowerCase());
+    if (hit) byId.set(hit.id, hit);
+    else problems.push(`未找到 <code>${escapeHtml(shortKw(t))}</code>`);
+  }
+
+  // 按 /list 的顺序输出，结果更可预期
+  const order = new Map(kws.map((k, i) => [k.id, i]));
+  const picked = [...byId.values()].sort((x, y) => order.get(x.id) - order.get(y.id));
+  return { picked, problems, confirmed };
+}
+
+/** 三个命令共用的用法说明 */
+function bulkUsage(cmd) {
+  return (
+    `· <code>/${cmd} 3</code> — 第 3 条\n` +
+    `· <code>/${cmd} 1 3 5</code> — 多条，空格或逗号分隔\n` +
+    `· <code>/${cmd} 1-5</code> — 一个范围\n` +
+    `· <code>/${cmd} 绿云 搬瓦工</code> — 按关键词名\n` +
+    `· <code>/${cmd} all</code> — 全部${
+      cmd === "remove" ? "（需再发 <code>/remove all confirm</code> 确认）" : ""
+    }`
+  );
+}
+
+async function cmdRemove(ctx, rest) {
+  const { user, chatId } = ctx;
+  const kws = listKeywords(user.telegram_id);
+  if (!kws.length) return reply(chatId, `${no} 暂无关键词`);
+
+  const sel = parseBulkSelector(rest, kws);
+  if (sel.empty) {
+    return reply(chatId, `${no} 用法：<code>/remove &lt;序号…|关键词|all&gt;</code>\n\n${bulkUsage("remove")}`);
+  }
+
+  // 全删不可撤销 —— 一条几百字符的正则重打一遍成本很高，加一步确认。
+  if (sel.all && !sel.confirmed) {
+    return reply(
+      chatId,
+      `${no} <b>将删除全部 ${kws.length} 条关键词</b>，此操作不可撤销。\n\n` +
+        `确认请发送：<code>/remove all confirm</code>\n` +
+        `<i>只想删其中几条，用 /remove 1 3 5 这种写法。</i>`
+    );
+  }
+
+  if (!sel.picked.length) {
+    return reply(chatId, `${no} 没有可删除的目标${problemsLine(sel.problems)}`);
+  }
+
+  let removed = 0;
+  for (const k of sel.picked) removed += removeKeywordById(user.telegram_id, k.id);
+  if (removed) bumpKeywordRevision(user.telegram_id);
+
+  const left = countKeywords(user.telegram_id);
+  const shown = sel.picked.slice(0, KW_LIST_MAX).map(kwLine).join("\n");
+  const more = sel.picked.length > KW_LIST_MAX ? `\n<i>…等 ${sel.picked.length} 条</i>` : "";
+  return reply(
+    chatId,
+    `${ok} 已删除 <b>${removed}</b> 条（剩 ${left} 条）\n\n${shown}${more}${problemsLine(sel.problems)}`
+  );
 }
 
 async function cmdToggle(ctx, rest, enabled) {
   const { user, chatId } = ctx;
-  const arg = rest.trim();
-  if (!arg) return reply(chatId, `${no} 用法：<code>/${enabled ? "resume" : "pause"} &lt;序号|关键词&gt;</code>`);
-
+  const verb = enabled ? "恢复" : "暂停";
   const kws = listKeywords(user.telegram_id);
-  let target = null;
-  if (/^\d+$/.test(arg)) {
-    target = kws[Number.parseInt(arg, 10) - 1] || null;
-  } else {
-    target = kws.find((k) => k.keyword.toLowerCase() === arg.toLowerCase()) || null;
-  }
-  if (!target) return reply(chatId, `${no} 未找到 <code>${escapeHtml(arg)}</code>`);
+  if (!kws.length) return reply(chatId, `${no} 暂无关键词`);
 
-  setKeywordEnabled(user.telegram_id, target.id, enabled);
-  bumpKeywordRevision(user.telegram_id);
+  const sel = parseBulkSelector(rest, kws);
+  if (sel.empty) {
+    return reply(
+      chatId,
+      `${no} 用法：<code>/${enabled ? "resume" : "pause"} &lt;序号…|关键词|all&gt;</code>\n\n${bulkUsage(
+        enabled ? "resume" : "pause"
+      )}`
+    );
+  }
+  if (!sel.picked.length) {
+    return reply(chatId, `${no} 没有匹配到关键词${problemsLine(sel.problems)}`);
+  }
+
+  let changed = 0;
+  let skipped = 0;
+  for (const k of sel.picked) {
+    if (Boolean(k.enabled) === enabled) {
+      skipped++; // 已经是目标状态，不必重复写库
+      continue;
+    }
+    setKeywordEnabled(user.telegram_id, k.id, enabled);
+    changed++;
+  }
+  if (changed) bumpKeywordRevision(user.telegram_id);
+
+  if (!changed) {
+    return reply(
+      chatId,
+      `${no} 这 ${sel.picked.length} 条本来就${enabled ? "是启用" : "已暂停"}状态，未做改动${problemsLine(
+        sel.problems
+      )}`
+    );
+  }
+
+  const shown = sel.picked.slice(0, KW_LIST_MAX).map(kwLine).join("\n");
+  const more = sel.picked.length > KW_LIST_MAX ? `\n<i>…等 ${sel.picked.length} 条</i>` : "";
+  const skipNote = skipped ? `（${skipped} 条本来就已${enabled ? "启用" : "暂停"}，跳过）` : "";
   return reply(
     chatId,
-    `${ok} <code>${escapeHtml(target.keyword)}</code> 已${enabled ? "恢复" : "暂停"}`
+    `${ok} 已${verb} <b>${changed}</b> 条${skipNote}\n\n${shown}${more}${problemsLine(sel.problems)}`
   );
 }
 
@@ -194,7 +352,8 @@ async function cmdList(ctx) {
   return reply(
     chatId,
     `<b>我的关键词</b>（${kws.length}/${formatQuota(q.maxKeywords)}）\n\n${lines.join("\n")}\n\n` +
-      `<i>用 /pause、/resume、/remove 加序号或关键词操作</i>`
+      `<i>用 /pause、/resume、/remove 操作。支持批量：</i>\n` +
+      `<code>/pause 1 3 5</code> · <code>/remove 1-5</code> · <code>/resume all</code>`
   );
 }
 

@@ -23,10 +23,22 @@ export const USER_HELP_SECTIONS = [
     items: [
       ["/add &lt;关键词&gt; [版块] [--regex]", "添加监控关键词"],
       ["/list", "查看我的关键词"],
-      ["/remove &lt;序号|关键词&gt;", "删除（/del 同义）"],
-      ["/pause &lt;序号|关键词&gt;", "暂停但不删除，可随时恢复"],
-      ["/resume &lt;序号|关键词&gt;", "恢复被暂停的规则"],
+      ["/remove &lt;序号…|关键词|all&gt;", "删除（/del 同义；支持批量，见下）"],
+      ["/pause &lt;序号…|关键词|all&gt;", "暂停但不删除，可随时恢复"],
+      ["/resume &lt;序号…|关键词|all&gt;", "恢复被暂停的规则"],
       ["/categories", "可用版块说明"],
+    ],
+  },
+  {
+    // 三个命令共用同一套选择器，集中说明一次，避免在每个命令描述里重复
+    title: "批量操作（/remove、/pause、/resume 通用）",
+    items: [
+      ["/pause 3", "单个：第 3 条"],
+      ["/pause 1 3 5", "多个：空格或逗号分隔都行（1,3,5）"],
+      ["/pause 1-5", "范围：第 1 到 5 条"],
+      ["/remove 绿云 搬瓦工", "按关键词名，不区分大小写"],
+      ["/pause all", "全部 /resume all 恢复全部"],
+      ["/remove all confirm", "删除全部需二次确认，防手滑"],
     ],
   },
   {
