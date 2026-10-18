@@ -316,11 +316,14 @@ async function cmdToggle(ctx, rest, enabled) {
   if (changed) bumpKeywordRevision(user.telegram_id);
 
   if (!changed) {
+    // 只在没有其它问题项时才用 ⚠️ 打头：problemsLine 自带 ⚠️，
+    // 两个叠在一起读起来像两件不同的事。
+    const head = sel.problems.length ? "" : `${no} `;
     return reply(
       chatId,
-      `${no} 这 ${sel.picked.length} 条本来就${enabled ? "是启用" : "已暂停"}状态，未做改动${problemsLine(
-        sel.problems
-      )}`
+      `${head}这 ${sel.picked.length} 条本来就${
+        enabled ? "是启用" : "已暂停"
+      }状态，未做改动${problemsLine(sel.problems)}`
     );
   }
 
