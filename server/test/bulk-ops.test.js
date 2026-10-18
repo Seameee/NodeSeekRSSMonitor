@@ -238,3 +238,22 @@ test("批量：结果里长正则被截断，避免消息超长", async () => {
   assert.ok(html.includes("…"), "长关键词应被截断显示");
   assert.ok(html.length < 4096, `结果消息不应超过 Telegram 上限，实际 ${html.length}`);
 });
+
+test("批量：结果带上 /list 的序号（同一正则按版块拆多条时能分清）", async () => {
+  // 真实场景：一条品牌名正则按 daily/tech/info/expose/trade 拆成 5 条，
+  // 关键词文本完全相同，只有版块不同。结果里若不带序号，
+  // 用户完全无法把这些行和 /list 里的位置对应起来。
+  freshUser();
+  const re = "^(?!.*收).*(家人|佳人|bitsflow|绿云)";
+  for (const cat of ["daily", "tech", "info", "expose", "trade"]) {
+    db.addKeyword(U, re, cat, "regex");
+  }
+  db.bumpKeywordRevision(U);
+
+  const html = await send("/pause 1 3 5");
+  for (const n of [1, 3, 5]) {
+    assert.match(html, new RegExp(`(^|\\n)${n}\\. `), `应带序号 ${n}.`);
+  }
+  assert.doesNotMatch(html, /(^|\n)2\. /, "未被选中的序号不应出现");
+  assert.doesNotMatch(html, /(^|\n)4\. /);
+});

@@ -156,11 +156,23 @@ function shortKw(s) {
   return t.length > KW_DISPLAY_MAX ? `${t.slice(0, KW_DISPLAY_MAX)}…` : t;
 }
 
-/** 结果列表里的一行 */
-function kwLine(k) {
+/** 结果列表里的一行。带序号：同一条正则按版块拆成多条时，
+ *  不带序号的话几行长得一模一样，用户无法对上 /list 里的位置。 */
+function kwLine(k, idx) {
   const mode = k.match_mode === "regex" ? " ·正则" : "";
   const cat = k.category ? ` ·${k.category}` : "";
-  return `· <code>${escapeHtml(shortKw(k.keyword))}</code>${mode}${cat}`;
+  return `${idx}. <code>${escapeHtml(shortKw(k.keyword))}</code>${mode}${cat}`;
+}
+
+/** 按 /list 的序号渲染受影响的条目 */
+function renderPicked(kws, picked) {
+  const posOf = new Map(kws.map((k, i) => [k.id, i + 1]));
+  const shown = picked
+    .slice(0, KW_LIST_MAX)
+    .map((k) => kwLine(k, posOf.get(k.id) ?? "?"))
+    .join("\n");
+  const more = picked.length > KW_LIST_MAX ? `\n<i>…等 ${picked.length} 条</i>` : "";
+  return `${shown}${more}`;
 }
 
 /** 未处理项的提示（最多列 5 项，避免刷屏） */
@@ -276,11 +288,10 @@ async function cmdRemove(ctx, rest) {
   if (removed) bumpKeywordRevision(user.telegram_id);
 
   const left = countKeywords(user.telegram_id);
-  const shown = sel.picked.slice(0, KW_LIST_MAX).map(kwLine).join("\n");
-  const more = sel.picked.length > KW_LIST_MAX ? `\n<i>…等 ${sel.picked.length} 条</i>` : "";
+  const shown = renderPicked(kws, sel.picked);
   return reply(
     chatId,
-    `${ok} 已删除 <b>${removed}</b> 条（剩 ${left} 条）\n\n${shown}${more}${problemsLine(sel.problems)}`
+    `${ok} 已删除 <b>${removed}</b> 条（剩 ${left} 条）\n\n${shown}${problemsLine(sel.problems)}`
   );
 }
 
@@ -327,12 +338,11 @@ async function cmdToggle(ctx, rest, enabled) {
     );
   }
 
-  const shown = sel.picked.slice(0, KW_LIST_MAX).map(kwLine).join("\n");
-  const more = sel.picked.length > KW_LIST_MAX ? `\n<i>…等 ${sel.picked.length} 条</i>` : "";
+  const shown = renderPicked(kws, sel.picked);
   const skipNote = skipped ? `（${skipped} 条本来就已${enabled ? "启用" : "暂停"}，跳过）` : "";
   return reply(
     chatId,
-    `${ok} 已${verb} <b>${changed}</b> 条${skipNote}\n\n${shown}${more}${problemsLine(sel.problems)}`
+    `${ok} 已${verb} <b>${changed}</b> 条${skipNote}\n\n${shown}${problemsLine(sel.problems)}`
   );
 }
 
