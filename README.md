@@ -512,6 +512,15 @@ docker compose pull && docker compose up -d
 
 schema 用 `CREATE TABLE IF NOT EXISTS` 幂等创建，直接升级即可，无需手动迁移。
 
+> **改了 compose 或 `.env` 之后**：`docker compose up -d` 会通过配置哈希检测到变化并**自动重建**容器（实测改 `cpus`、改 `env_file` 都会触发 `Recreated`）。所以通常不需要手动 `--force-recreate`。
+>
+> 如果改了配置却看到 `Container ... Running`（没有 `Recreated`），说明 compose 认为没变化——此时才需要 `--force-recreate`。改完建议直接核对容器实际值，比看文件可靠：
+>
+> ```bash
+> docker inspect nodeseek-monitor --format 'NanoCpus={{.HostConfig.NanoCpus}}'   # 1e9 = 1 核
+> docker exec nodeseek-monitor sh -c 'cat /sys/fs/cgroup/cpu.max'                # 100000 100000 = 1 核
+> ```
+
 ### 健康检查
 
 ```bash
