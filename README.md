@@ -34,6 +34,7 @@ Agent 需要知道的三个硬约束（写在这里省得它踩坑）：
 ### 前置条件
 
 - Docker 20.10+ 与 Docker Compose v2（`docker compose` 命令）
+- 1 核 CPU 起（compose 默认 `cpus: "1.0"`，见下方[CPU 与并发](#cpu-与并发)）
 - 内存 128 MB 起（默认限制 512 MB）
 - 能访问 `api.telegram.org` 与 `rss.nodeseek.com`
 - 一个 Bot Token：[@BotFather](https://t.me/BotFather) → `/newbot`
@@ -385,6 +386,42 @@ cd server && docker compose up -d --build
 ---
 
 ## 性能与容量
+
+### CPU 与并发
+
+**默认给容器 1 核**（`docker-compose.yml` 里的 `deploy.resources.limits.cpus: "1.0"`）。
+
+这个服务是 **I/O 密集**的：大部分时间在等 RSS、等 Telegram、等 AI 上游，CPU 只在解析 XML 和跑关键词正则时短暂忙一下。所以 1 核足够常规规模使用，也不会跟同机的其它服务抢资源——默认值取保守，需要的人自己调大。
+
+worker 线程池会**自动**跟着配额走（用 `os.availableParallelism()` 读 cgroup 限额）：
+
+| `cpus` | 容器可用 CPU | 自动线程数 | 匹配阶段（2000 用户 × 20 词） |
+| --- | --- | --- | --- |
+| `"1.0"`（默认） | 1 | 2 | 3180 ms |
+| `"2.0"` | 2 | 2 | 1437 ms |
+| `"3.0"` | 3 | 3 | — |
+| `"4.0"` | 4 | 4 | — |
+
+从 1 核放到 2 核，匹配阶段快约 2 倍（正好等于配额翻倍）。**用户数到千级、或关键词是大列表正则时，建议给到 2~4 核。**
+
+改法：编辑 `docker-compose.yml` 里的 `cpus`，然后 `docker compose up -d` 重建容器。
+
+> **注意两个坑：**
+>
+> 1. `cpus` 是 cgroup 配额，**不会**让 `os.cpus()` 变小——它照样报宿主机核数。所以线程数绝不能按 `os.cpus()` 取，否则会在 1 核配额里开 4 个线程互相抢（实测同一负载 452 ms → 3180 ms）。代码里已经用 `availableParallelism()` 修正，**不要手动设 `WORKER_POOL_SIZE` 覆盖它**。
+> 2. 给满（如 `"4.0"`）时，突发流量下本服务可以和同机其它容器争满 4 核。共享机器上请留余量。
+
+如果你的宿主核数较多、又不想改 git 里的默认值，用 override 文件即可（不会和上游改动冲突）：
+
+```yaml
+# docker-compose.override.yml，与 docker-compose.yml 同目录
+services:
+  nodeseek-monitor:
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+```
 
 ### 一轮只抓一次 RSS
 
