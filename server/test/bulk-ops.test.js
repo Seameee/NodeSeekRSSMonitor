@@ -257,3 +257,46 @@ test("批量：结果带上 /list 的序号（同一正则按版块拆多条时�
   assert.doesNotMatch(html, /(^|\n)2\. /, "未被选中的序号不应出现");
   assert.doesNotMatch(html, /(^|\n)4\. /);
 });
+
+test("批量：关键词本身含空格时，仍能按完整名称操作（旧行为不能丢）", async () => {
+  // 回归用例。加入批量之前，/remove 是把**整个参数**当一个关键词名去比对的，
+  // 所以 `/remove 绿云 补货` 能删掉名为「绿云 补货」的那一条。
+  // 改成按空格切分后，它被拆成两个不存在的词，直接报「没有匹配到关键词」。
+  freshUser();
+  db.addKeyword(U, "绿云 补货", null, "substring");
+  db.addKeyword(U, "搬瓦工", null, "substring");
+  db.bumpKeywordRevision(U);
+
+  const html = await send("/pause 绿云 补货");
+  assert.match(html, /已暂停 <b>1<\/b> 条/, `含空格的关键词应被整体匹配，实际回复：${html}`);
+  assert.equal(db.listKeywords(U)[0].enabled, 0, "「绿云 补货」应被暂停");
+  assert.equal(db.listKeywords(U)[1].enabled, 1, "「搬瓦工」不应受影响");
+});
+
+test("批量：含空格关键词与普通批量写法可以共存", async () => {
+  freshUser();
+  db.addKeyword(U, "绿云 补货", null, "substring");
+  db.addKeyword(U, "搬瓦工", null, "substring");
+  db.addKeyword(U, "hostdzire", null, "substring");
+  db.bumpKeywordRevision(U);
+
+  // 多个不含空格的名字 -> 走批量
+  await send("/pause 搬瓦工 hostdzire");
+  let enabled = db.listKeywords(U).map((k) => k.enabled);
+  assert.deepEqual(enabled, [1, 0, 0], "两个名字都应被暂停，含空格那条不动");
+
+  // 含空格的完整名称 -> 走单条
+  await send("/pause 绿云 补货");
+  enabled = db.listKeywords(U).map((k) => k.enabled);
+  assert.deepEqual(enabled, [0, 0, 0]);
+});
+
+test("批量：正则里带空格时也能按完整名称暂停", async () => {
+  freshUser();
+  const re = "补货 .*(CN2|GIA)";
+  db.addKeyword(U, re, "trade", "regex");
+  db.bumpKeywordRevision(U);
+  const html = await send(`/pause ${re}`);
+  assert.match(html, /已暂停 <b>1<\/b> 条/, `正则含空格应整体匹配，实际：${html}`);
+  assert.equal(db.listKeywords(U)[0].enabled, 0);
+});

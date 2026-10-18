@@ -192,10 +192,8 @@ function problemsLine(problems) {
  * 返回 { all?: true, picked: [], problems: [], confirmed, empty? }
  */
 function parseBulkSelector(rest, kws) {
-  const tokens = String(rest || "")
-    .trim()
-    .split(/[\s,，、]+/)
-    .filter(Boolean);
+  const raw = String(rest || "").trim();
+  const tokens = raw.split(/[\s,，、]+/).filter(Boolean);
 
   let confirmed = false;
   const kept = [];
@@ -204,6 +202,13 @@ function parseBulkSelector(rest, kws) {
     else kept.push(t);
   }
   if (!kept.length) return { picked: [], problems: [], confirmed, empty: true };
+
+  // **关键词本身可以含空格**（正则里常有空格，比如 `补货 .* CN2`）。所以先拿
+  // 「整个参数」当一条关键词名去精确匹配：命中就按单条处理 —— 这正是加入批量
+  // 之前的旧行为，不能因为支持批量而让它失效。
+  const whole = kept.join(" ").toLowerCase();
+  const wholeHit = kws.find((k) => k.keyword.toLowerCase() === whole);
+  if (wholeHit) return { picked: [wholeHit], problems: [], confirmed };
 
   if (kept.some((t) => t.toLowerCase() === "all")) {
     if (kept.length > 1) {
