@@ -188,7 +188,10 @@ function parseRSS(xml, sourceIndex = 0) {
       return r ? (r[1] || r[2] || "").trim() : "";
     };
 
-    const link = tag("link") || (b.match(/<link[^>]+href="([^"]*)"/) || [])[1] || "";
+    // 必须是 let：备用源分支里会把 link 改写成 NodeSeek 原始链接（见下方 nsLink）。
+    // 原先写成 const，worker 打包时直接报 Cannot assign to "link" because it is a constant，
+    // 导致整个 Worker 无法部署。
+    let link = tag("link") || (b.match(/<link[^>]+href="([^"]*)"/) || [])[1] || "";
     const id = tag("id") || tag("guid");
     // 正文：主源是帖子正文纯文本，备用源是 TG 频道的转发文案
     const description = tag("description");
@@ -389,6 +392,140 @@ async function getSettings(db, keys) {
   return out;
 }
 
+// ─── 勿扰模式 ────────────────────────────────────────────────────────────────
+//
+// Worker 版是**单用户**（只服务 ALLOWED_USER_ID 那一个人），所以没有
+// 「按用户隔离」的问题 —— 状态直接存在 settings 里即可，天然只影响自己。
+//
+// 语义与 Docker 版一致：**暂停推送**，不是静音发送。
+//   Bot API 的 disable_notification 只做到「通知无声」，消息照旧弹通知栏；
+//   用户要的是完全不打扰。而「灰色圆点、不进未读」是 Telegram 账号级的
+//   chat 设置，Bot API 无权修改接收方聊天状态，任何 bot 都做不到。
+// 期间命中的帖子落库（status='muted'），用 /dnd backlog 补看。
+//
+// 键值：
+//   dnd_mode   off | on | until | window
+//   dnd_until  ISO 时间（until 用）
+//   dnd_start / dnd_end  "HH:MM"（window 用）
+//   dnd_tz     时区，默认 Asia/Shanghai
+//   dnd_since  补看起点
+const DND_KEYS = ["dnd_mode", "dnd_until", "dnd_start", "dnd_end", "dnd_tz", "dnd_since"];
+
+/** 把 HH:MM 解析成当天第几分钟；非法返回 null */
+function parseHm(t) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || "").trim());
+  if (!m) return null;
+  const h = parseInt(m[1], 10), mi = parseInt(m[2], 10);
+  if (h > 23 || mi > 59) return null;
+  return h * 60 + mi;
+}
+
+/** "23:00-08:00" → {start,end}；起止相同拒收（语义歧义，用 on 表达） */
+function parseWindow(text) {
+  const m = /^(\d{1,2}:\d{2})\s*(?:-|~|～|—|–|至|到)\s*(\d{1,2}:\d{2})$/.exec(String(text || "").trim());
+  if (!m) return null;
+  const s = parseHm(m[1]), e = parseHm(m[2]);
+  if (s === null || e === null || s === e) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  return {
+    start: `${pad(Math.floor(s / 60))}:${pad(s % 60)}`,
+    end: `${pad(Math.floor(e / 60))}:${pad(e % 60)}`,
+  };
+}
+
+/** 90m / 2h / 1d / 8小时 / 45分钟；不带单位按分钟。返回毫秒或 null */
+function parseDuration(text) {
+  const m = /^(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes|分|分钟|h|hr|hrs|hour|hours|小时|时|d|day|days|天)?$/i
+    .exec(String(text || "").trim());
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const u = (m[2] || "m").toLowerCase();
+  let ms;
+  if (["m", "min", "mins", "minute", "minutes", "分", "分钟"].includes(u)) ms = n * 60000;
+  else if (["h", "hr", "hrs", "hour", "hours", "小时", "时"].includes(u)) ms = n * 3600000;
+  else ms = n * 86400000;
+  if (ms < 60000 || ms > 30 * 86400000) return null;
+  return ms;
+}
+
+/** 某时刻在指定时区是当天第几分钟（0~1439） */
+function minutesOfDay(ms, tz) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).formatToParts(new Date(ms));
+    let h = 0, mi = 0;
+    for (const p of parts) {
+      if (p.type === "hour") h = Number(p.value) % 24;
+      else if (p.type === "minute") mi = Number(p.value);
+    }
+    return h * 60 + mi;
+  } catch {
+    return null;
+  }
+}
+
+/** 按用户时区格式化，用于回复文案 */
+function fmtInTz(ms, tz) {
+  try {
+    return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: tz, month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).format(new Date(ms)).replace(/\//g, "-");
+  } catch {
+    return new Date(ms).toISOString().slice(5, 16).replace("T", " ");
+  }
+}
+
+const DND_TZ_DEFAULT = "Asia/Shanghai";
+
+/** 当前是否处于勿扰（纯函数，便于命令层与轮询层共用同一判定） */
+function dndActive(st, nowMs = Date.now()) {
+  const mode = st.dnd_mode || "off";
+  if (mode === "off") return false;
+  if (mode === "on") return true;
+  if (mode === "until") {
+    const u = Date.parse(st.dnd_until || "");
+    return Number.isFinite(u) && nowMs < u;
+  }
+  if (mode === "window") {
+    const s = parseHm(st.dnd_start), e = parseHm(st.dnd_end);
+    if (s === null || e === null || s === e) return false;
+    const cur = minutesOfDay(nowMs, st.dnd_tz || DND_TZ_DEFAULT);
+    if (cur === null) return false;
+    // 跨零点必须用「或」，否则凌晨那几小时会被判成不静音
+    return s < e ? cur >= s && cur < e : cur >= s || cur < e;
+  }
+  return false;
+}
+
+/** 下一次状态翻转时刻；off/on 不会自动翻转 → null */
+function dndNextChange(st, nowMs = Date.now()) {
+  const mode = st.dnd_mode || "off";
+  if (mode === "until") {
+    const u = Date.parse(st.dnd_until || "");
+    return Number.isFinite(u) && u > nowMs ? u : null;
+  }
+  if (mode === "window") {
+    const s = parseHm(st.dnd_start), e = parseHm(st.dnd_end);
+    if (s === null || e === null || s === e) return null;
+    const cur = minutesOfDay(nowMs, st.dnd_tz || DND_TZ_DEFAULT);
+    if (cur === null) return null;
+    const active = dndActive(st, nowMs);
+    let delta = active ? (e - cur + 1440) % 1440 : (s - cur + 1440) % 1440;
+    if (delta === 0) delta = 1440;
+    return nowMs + delta * 60000;
+  }
+  return null;
+}
+
+/** 补看起点：没记录过就用 24 小时前兜底 */
+function dndSinceOf(st) {
+  const s = st.dnd_since;
+  return s && Number.isFinite(Date.parse(s)) ? s : new Date(Date.now() - 86400000).toISOString();
+}
+
 // ─── Dev 模式状态 ────────────────────────────────────────────────────────────
 // settings.dev_left：不存在/空串 = 关闭；-1 = 无限；N>0 = 还剩 N 条可推送
 const DEV_KEY = "dev_left";
@@ -478,13 +615,35 @@ async function logNotif(db, post, kw, status) {
   ).bind(post.post_id, kw, post.title, post.link, post.category, post.author, status, now()).run();
 }
 
+// /history 必须排除 status='muted'：那些是勿扰期间被拦下、从未发出的帖子。
+// 它们和真正的推送共用 notifications 表，不排除会显示一堆
+// 「明明没收到却被说成推送过」的记录，用户会以为勿扰失效。
+// 补看走 /dnd backlog，两条路径语义分开。
 async function getHistory(db, limit) {
   return (await db.prepare(
     `SELECT post_id, GROUP_CONCAT(DISTINCT keyword) AS keywords,
             title, link, category, author,
             MIN(status) AS status, MAX(sent_at) AS sent_at
-     FROM notifications GROUP BY post_id ORDER BY sent_at DESC LIMIT ?1`
+     FROM notifications WHERE status <> 'muted'
+     GROUP BY post_id ORDER BY sent_at DESC LIMIT ?1`
   ).bind(limit).all()).results;
+}
+
+/** 勿扰期间被拦下的命中，供 /dnd backlog 补看 */
+async function getMutedHits(db, sinceIso, limit) {
+  return (await db.prepare(
+    `SELECT post_id, GROUP_CONCAT(DISTINCT keyword) AS keywords,
+            title, link, category, author, MAX(sent_at) AS sent_at
+     FROM notifications WHERE status='muted' AND sent_at >= ?1
+     GROUP BY post_id ORDER BY sent_at DESC LIMIT ?2`
+  ).bind(sinceIso, limit).all()).results;
+}
+
+async function countMutedHits(db, sinceIso) {
+  const r = await db.prepare(
+    "SELECT COUNT(DISTINCT post_id) AS n FROM notifications WHERE status='muted' AND sent_at >= ?1"
+  ).bind(sinceIso).first();
+  return r ? r.n : 0;
 }
 
 // 清理过期数据。已按 seen_at / sent_at 建索引，但仍不必每分钟执行，
@@ -530,6 +689,7 @@ async function handleCommand(env, message) {
       "/list  — 列表\n" +
       "/history <i>[数量]</i>  — 推送记录（默认 10）\n" +
       "/dev <i>[条数|exit]</i>  — Dev 模式：暂停关键词，任何新帖都推送\n" +
+      "/dnd <i>[时长|时段|on|off|backlog]</i>  — 勿扰：暂停推送，可补看\n" +
       "/status  — 运行状态\n\n" +
       "🏷 <b>可用版块：</b>\n" +
       "<code>daily</code> 日常 · <code>tech</code> 技术 · <code>info</code> 情报 · <code>review</code> 测评 · <code>trade</code> 交易\n" +
@@ -664,6 +824,139 @@ async function handleCommand(env, message) {
     return sendMsg(token, chatId, ps.join("\n\n"));
   }
 
+  if (cmd === "/dnd" || cmd === "/mute") {
+    const raw = args.join(" ");
+    const head = (args[0] || "").toLowerCase();
+    const cur = await getSettings(db, DND_KEYS);
+
+    // 无参数 = 状态
+    if (!raw) {
+      const since = dndSinceOf(cur);
+      const missed = await countMutedHits(db, since);
+      const mode = cur.dnd_mode || "off";
+      let line;
+      if (mode === "off") line = "已关闭，推送正常。";
+      else if (mode === "on") line = "已开启（长期），直到 /dnd off。";
+      else if (mode === "until") {
+        const u = Date.parse(cur.dnd_until || "");
+        line = Number.isFinite(u) && u > Date.now()
+          ? `暂停至 <b>${fmtInTz(u, cur.dnd_tz || DND_TZ_DEFAULT)}</b>，到点自动恢复。`
+          : "定时暂停已到期（即将自动恢复）。";
+      } else {
+        const nx = dndNextChange(cur);
+        const range = `${cur.dnd_start || "?"}–${cur.dnd_end || "?"}`;
+        line = `每日 <b>${range}</b>（${cur.dnd_tz || DND_TZ_DEFAULT}）暂停；` +
+          (nx ? `<b>${fmtInTz(nx, cur.dnd_tz || DND_TZ_DEFAULT)}</b> ${dndActive(cur) ? "恢复推送" : "开始暂停"}。` : "");
+      }
+      const ml = missed > 0 ? `\n📬 期间错过：<b>${missed}</b> 条，用 /dnd backlog 补看` : "";
+      return sendMsg(token, chatId,
+        `🔕 <b>勿扰模式</b>：${dndActive(cur) ? "暂停推送中" : "未开启"}\n` +
+        `状态：${line}${ml}\n\n` +
+        `<i>开启后推送完全不发，用 /dnd backlog 补看。</i>`
+      );
+    }
+
+    if (["off", "关", "关闭", "停", "stop"].includes(head)) {
+      await setSetting(db, "dnd_mode", "off");
+      const missed = await countMutedHits(db, dndSinceOf(cur));
+      const tail = missed > 0 ? `\n\n期间错过 ${missed} 条，可用 /dnd backlog 补看。` : "";
+      return sendMsg(token, chatId, `🔔 已关闭勿扰模式，推送恢复正常。${tail}`);
+    }
+
+    if (["on", "开", "开启"].includes(head)) {
+      await setSetting(db, "dnd_mode", "on");
+      if (!cur.dnd_since) await setSetting(db, "dnd_since", now());
+      return sendMsg(token, chatId,
+        "🔕 <b>已开启勿扰模式（长期）</b>\n\n" +
+        "推送将<b>暂停</b>，期间命中的帖子会记录下来。\n" +
+        "补看：/dnd backlog\n恢复：/dnd off"
+      );
+    }
+
+    if (["status", "状态", "查询"].includes(head)) {
+      return handleCommand(env, { ...message, text: "/dnd" });
+    }
+
+    if (["backlog", "补看", "missed", "错过"].includes(head)) {
+      if (args.some((a) => ["--clear", "clear", "清空"].includes(a.toLowerCase()))) {
+        // 锚点前移 1 秒：查询是 sent_at >= since（含等号），同一毫秒的命中
+        // 仍会被算进来，表现为「刚清空又冒出来」。
+        await setSetting(db, "dnd_since", new Date(Date.now() + 1000).toISOString());
+        return sendMsg(token, chatId, "✅ 已清空补看记录，之后只显示新的错过帖子。");
+      }
+      const since = dndSinceOf(cur);
+      const rows = await getMutedHits(db, since, 20);
+      if (!rows.length) {
+        return sendMsg(token, chatId, "📭 勿扰期间没有错过任何帖子。");
+      }
+      const total = await countMutedHits(db, since);
+      const ps = [`📬 <b>勿扰期间错过 ${total} 条</b>`, ""];
+      for (const r of rows) {
+        const t = fmtInTz(Date.parse(r.sent_at), cur.dnd_tz || DND_TZ_DEFAULT);
+        ps.push(`· <a href="${r.link}">${esc(r.title.slice(0, 60))}</a>\n  <i>${t}</i>`);
+      }
+      if (total > rows.length) ps.push(`\n<i>共 ${total} 条，这里显示最近 ${rows.length} 条。</i>`);
+      ps.push("\n<i>看完可发 /dnd backlog --clear 清空记录。</i>");
+      return sendMsg(token, chatId, ps.join("\n"));
+    }
+
+    if (["tz", "timezone", "时区"].includes(head)) {
+      const tz = args[1];
+      if (!tz) {
+        return sendMsg(token, chatId,
+          `用法：/dnd tz Asia/Shanghai\n当前：<code>${esc(cur.dnd_tz || DND_TZ_DEFAULT)}</code>`);
+      }
+      let okTz = false;
+      try { new Intl.DateTimeFormat("en-GB", { timeZone: tz }); okTz = /^[A-Za-z][A-Za-z0-9_+\/-]*$/.test(tz); } catch { okTz = false; }
+      if (!okTz) {
+        return sendMsg(token, chatId,
+          `⚠️ 无法识别的时区：<code>${esc(tz)}</code>\n请用 IANA 名称，如 <code>Asia/Shanghai</code>`);
+      }
+      await setSetting(db, "dnd_tz", tz);
+      return sendMsg(token, chatId, `✅ 时区已设为 <code>${esc(tz)}</code>`);
+    }
+
+    const win = parseWindow(raw);
+    if (win) {
+      await setSetting(db, "dnd_start", win.start);
+      await setSetting(db, "dnd_end", win.end);
+      await setSetting(db, "dnd_mode", "window");
+      if (!cur.dnd_since) await setSetting(db, "dnd_since", now());
+      const tz = cur.dnd_tz || DND_TZ_DEFAULT;
+      return sendMsg(token, chatId,
+        `🔕 <b>已设置每日暂停时段</b>\n\n` +
+        `每日 <b>${win.start}–${win.end}</b>（${tz}）暂停推送。\n` +
+        `期间命中的帖子会记录，用 /dnd backlog 补看。\n\n` +
+        `<i>立即恢复用 /dnd off。</i>`
+      );
+    }
+
+    const dur = parseDuration(raw);
+    if (dur) {
+      const until = new Date(Date.now() + dur).toISOString();
+      await setSetting(db, "dnd_until", until);
+      await setSetting(db, "dnd_mode", "until");
+      if (!cur.dnd_since) await setSetting(db, "dnd_since", now());
+      const tz = cur.dnd_tz || DND_TZ_DEFAULT;
+      return sendMsg(token, chatId,
+        `🔕 <b>已开启定时暂停</b>\n\n` +
+        `暂停至 <b>${fmtInTz(Date.parse(until), tz)}</b>（${tz}），到点自动恢复。\n` +
+        `期间命中的帖子会记录，用 /dnd backlog 补看。\n\n` +
+        `<i>提前恢复用 /dnd off。</i>`
+      );
+    }
+
+    return sendMsg(token, chatId,
+      `⚠️ 无法识别：<code>${esc(raw)}</code>\n\n` +
+      "🔕 <b>勿扰模式（暂停推送）</b>\n\n" +
+      "· <code>/dnd 2h</code> — 暂停 2 小时\n" +
+      "· <code>/dnd 23:00-08:00</code> — 每天这个时段暂停\n" +
+      "· <code>/dnd on</code> / <code>/dnd off</code> — 长期暂停 / 恢复\n" +
+      "· <code>/dnd backlog</code> — 补看错过的帖子\n" +
+      "· <code>/dnd tz Asia/Shanghai</code> — 设时区"
+    );
+  }
+
   if (cmd === "/categories") {
     const ls = ["🏷 <b>可用版块：</b>\n"];
     for (const [s, n] of Object.entries(CATEGORIES)) ls.push(`• <code>${s}</code> — ${n}`);
@@ -724,15 +1017,22 @@ async function handleCommand(env, message) {
     const dl = dev
       ? `🧪 Dev 模式：<b>开启</b>（${dev.left < 0 ? "无限" : `剩余 ${dev.left} 条`}，关键词过滤已暂停）\n`
       : `🧪 Dev 模式：关闭\n`;
+    const dndSt = await getSettings(db, DND_KEYS);
+    const dndOn = dndActive(dndSt);
+    const dndMissed = dndOn ? await countMutedHits(db, dndSinceOf(dndSt)) : 0;
+    const nl = dndOn
+      ? `🔕 勿扰模式：<b>暂停推送中</b>${dndMissed > 0 ? `（期间错过 ${dndMissed} 条，/dnd backlog 补看）` : ""}\n`
+      : `🔔 勿扰模式：关闭\n`;
     const sources = RSS_BACKUP_SOURCES.map((url, i) => `  ${i + 1}. ${i === 0 ? '✓' : '○'} ${url}`).join('\n');
     return sendMsg(token, chatId,
       `✅ <b>Bot 运行正常</b> (Workers)\n\n` +
       `📊 监控关键词：${act} 个\n${pl}` +
       dl +
+      nl +
       al +
       `⏱ 轮询间隔：Cron 每分钟\n` +
       `🚦 防洪上限：10 条/轮\n` +
-      `🔄 已初始化：${ini ? "是" : "否（首轮后完成）"}\n` +
+      `🔄 已轮询过：${ini ? "是" : "否（下一轮开始推送）"}\n` +
       `📈 连续失败：${failCount} 次\n\n` +
       `🌐 RSS 数据源（✓主源）：\n${sources}`
     );
@@ -830,7 +1130,9 @@ async function pollRSS(env) {
   await initDB(db);
 
   // 本轮需要的 settings 一次读完（原来分散成 4 次往返）
-  const st = await getSettings(db, [DEV_KEY, "rss_fail_count", "initialized", "last_cleanup"]);
+  const st = await getSettings(db, [DEV_KEY, "rss_fail_count", "initialized", "last_cleanup", ...DND_KEYS]);
+  // 勿扰判定只读 st，不做额外查询
+  const inDnd = dndActive(st);
 
   // Dev 模式：暂停关键词过滤，任何新帖都推送（受条数与防洪上限约束）
   const dev = devFromValue(st[DEV_KEY]);
@@ -877,12 +1179,16 @@ async function pollRSS(env) {
 
   if (!entries.size) return;
 
-  // 首次运行：静默初始化
+  // 首轮不做特殊处理：与 Docker 版保持一致，直接进入关键词匹配。
+  //
+  // 这里原先有一段「首次运行静默标记全部帖子」的逻辑，作用是避免部署后立刻
+  // 被历史帖子刷屏。但它与 Docker 版行为不一致，同一个关键词在两个版本上
+  // 表现不同，容易误判成 bug。现已统一：首轮同样会推送当前 feed 中命中的帖子。
+  //
+  // 需要抑制首轮推送时，先只加一个精确的关键词，或临时用 /dnd on 暂停。
   if (st["initialized"] !== "true") {
-    console.log(`首次轮询，静默标记 ${entries.size} 篇帖子`);
-    await markSeen(db, [...entries.keys()]);
+    // 仅记录一个标记，供 /status 展示，不再影响推送行为
     await setSetting(db, "initialized", "true");
-    return;
   }
 
   // 匹配
@@ -920,6 +1226,20 @@ async function pollRSS(env) {
   if (consumed.length) await markSeen(db, consumed);
 
   if (!notifs.length) return;
+
+  // 勿扰模式：**完全不发**，只把命中落库供 /dnd backlog 补看。
+  // 放在 markSeen 之后是必须的 —— 否则这些帖子会被反复匹配、每轮都重复记一遍。
+  // 也刻意跳过 AI 摘要：消息都不发，摘要没人看还要照付上游费用。
+  if (inDnd) {
+    console.log(`勿扰模式：拦下 ${notifs.length} 条，不发送`);
+    for (const { post, matched } of notifs) {
+      for (const k of (matched.length ? matched : ["(dev)"])) {
+        await logNotif(db, post, k, "muted");
+      }
+    }
+    return;
+  }
+
   console.log(`发送 ${notifs.length} 条通知`);
 
   // 发送（带防洪）

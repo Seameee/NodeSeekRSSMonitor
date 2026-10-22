@@ -1,0 +1,264 @@
+// ============================================================================
+// 命令路由与权限判定
+//
+// 唯一的入口。鉴权顺序：
+//   1. 是否私聊（默认拒绝群聊，避免被当成公共机器人滥用）
+//   2. 命令限流（防刷）
+//   3. 管理员白名单 → 只放行 /admin，管理员也能用普通命令
+//   4. 普通用户 → 必须先 /bind，且状态必须是 active
+//   5. 未注册用户只放行 /bind /start /help
+// ============================================================================
+import { config } from "./config.js";
+import {
+  bumpKeywordRevision,
+  claimOwnership,
+  createUser,
+  getUser,
+  hasAnyUser,
+  isAdminUser,
+  isMultiUserEnabled,
+  touchUser,
+} from "./db.js";
+import { checkBindCooldown, checkUsable, countCommand, markBind, takeCommandToken } from "./quota.js";
+import { sendMessage } from "./telegram.js";
+import { buildHelp } from "./notify.js";
+import { handleUserCommand, reply } from "./commands-user.js";
+import { handleAdminCommand } from "./commands-admin.js";
+import { log } from "./logger.js";
+
+/** 未注册用户即可使用的命令 */
+const PUBLIC_COMMANDS = new Set(["/start", "/help", "/bind"]);
+
+/**
+ * 注册流程。三条分支：
+ *   1. 系统还没有任何用户 → 本次 /bind 认领所有权，该用户成为管理员
+ *      （单用户与多用户模式都是这个规则，保证部署后能立刻拿到管理权）
+ *   2. 多用户模式开启 → 正常注册为普通用户（受 REGISTRATION_OPEN 与人数上限约束）
+ *   3. 多用户模式关闭 → 拒绝，只有管理员能用
+ */
+async function doBind(chatId, from) {
+  const id = from.id;
+
+  const cd = checkBindCooldown(id);
+  if (!cd.ok) {
+    return reply(chatId, `⏳ 操作过于频繁，请 ${Math.ceil(cd.retryAfterMs / 1000)} 秒后再试。`);
+  }
+
+  const existing = getUser(id);
+  if (existing) {
+    if (existing.status === "banned") {
+      return reply(chatId, "🚫 你的账号已被封禁，如有疑问请联系管理员。");
+    }
+    markBind(id);
+    const role = isAdminUser(existing) ? "管理员" : "普通用户";
+    return reply(
+      chatId,
+      `你已经注册过了。\n\n<b>ID</b>：<code>${id}</code>（${role}）\n` +
+        `用 /add 添加关键词即可开始接收推送。`
+    );
+  }
+
+  // ── 分支 1：首个用户认领所有权 ──────────────────────────────────────────
+  // 无需检查多用户开关：部署后第一个人必须是管理员，否则没人能管理这个实例。
+  //
+  // **但配了 ADMIN_TELEGRAM_IDS 时只允许白名单里的人认领**：「没人能管理」这个
+  // 前提只在未配白名单时成立；配了白名单的话，白名单管理员本来就能 /bind 拿回
+  // 管理权（见下面分支 3 的放行）。若仍让陌生人认领，等于把实例管理员直接送给
+  // 第一个碰巧发 /bind 的人，白名单就形同虚设了。
+  // 非白名单用户会继续往下走：单用户模式被拒、多用户模式注册为普通用户。
+  const mayClaimOwnership = config.adminIds.size === 0 || config.adminIds.has(id);
+  if (mayClaimOwnership && !hasAnyUser()) {
+    const claimed = claimOwnership({
+      telegramId: id,
+      username: from.username,
+      displayName: [from.first_name, from.last_name].filter(Boolean).join(" "),
+    });
+    if (!claimed) {
+      // 极少见：并发认领失败，回到下面的常规分支重新判断
+      return doBind(chatId, from);
+    }
+    markBind(id);
+    log.info("bind", `首用户 ${id} (${from.username || "-"}) 已认领所有权，成为管理员`);
+    return reply(
+      chatId,
+      `🎉 <b>欢迎，你已成为本实例的管理员</b>\n\n` +
+        `<b>你的 ID</b>：<code>${id}</code>\n\n` +
+        `<b>当前模式</b>：${isMultiUserEnabled() ? "多用户" : "单用户（默认）"}\n` +
+        (isMultiUserEnabled()
+          ? "其他人可以 /bind 自助开通。\n"
+          : "只有你能使用本 Bot。需要开放给他人时，发 <code>/admin multiuser on</code>。\n") +
+        `\n<b>接下来</b>\n` +
+        `1. <code>/add 关键词 [版块]</code> — 添加监控关键词（不添加 = 收不到推送；不带版块 = 全部版块）\n` +
+        `2. <code>/ai set &lt;key&gt;</code> — 可选，配置后通知会带 AI 摘要\n` +
+        `3. <code>/admin</code> — 管理面板\n\n` +
+        `<i>建议现在就把本 Bot 设为私密，避免陌生人在你之前完成认领。</i>`
+    );
+  }
+
+  // 白名单管理员必须一路放行：这是 README 承诺的「找回管理权」入口，
+  // 若把它和普通新用户一起挡掉，实例被陌生人抢先认领后就再无入口。
+  const whitelisted = config.adminIds.has(id);
+
+  // ── 分支 3：单用户模式下拒绝新用户（白名单管理员除外）──────────────────
+  if (!isMultiUserEnabled() && !whitelisted) {
+    return reply(
+      chatId,
+      "🚪 <b>本实例当前为单用户模式</b>\n\n只有管理员可以使用。\n" +
+        "如需开通，请联系实例管理员。"
+    );
+  }
+
+  // ── 分支 2：多用户模式下的常规注册 ──────────────────────────────────────
+  if (!config.registrationOpen && !whitelisted) {
+    return reply(chatId, "🚪 当前未开放注册，请联系管理员开通。");
+  }
+
+  const { countUsers } = await import("./db.js");
+  if (countUsers() >= config.maxUsers) {
+    return reply(chatId, `🚪 用户数已达上限（${config.maxUsers}），请联系管理员。`);
+  }
+
+  const created = createUser({
+    telegramId: id,
+    username: from.username,
+    displayName: [from.first_name, from.last_name].filter(Boolean).join(" "),
+    role: config.adminIds.has(id) ? "admin" : "user",
+  });
+  if (!created) return reply(chatId, "注册失败，请稍后再试。");
+  markBind(id);
+
+  log.info("bind", `新用户 ${id} (${from.username || "-"}) 注册`);
+  return reply(
+    chatId,
+    `✅ <b>注册成功</b>\n\n<b>你的 ID</b>：<code>${id}</code>\n\n` +
+      `<b>接下来</b>\n` +
+      `1. <code>/add 关键词 [版块]</code> — 添加监控关键词（不添加 = 收不到推送；不带版块 = 全部版块）\n` +
+      `2. <code>/ai set &lt;key&gt;</code> — 可选，配置后通知会带 AI 摘要\n` +
+      `3. <code>/help</code> — 查看全部命令\n\n` +
+      `<i>你的关键词与 AI 配置完全独立，其他用户与管理员的配置互不可见。</i>`
+  );
+}
+
+/**
+ * 处理一条更新。返回 true 表示已消费。
+ */
+export async function handleUpdate(update) {
+  const msg = update.message;
+  if (!msg || !msg.text) return false;
+  const from = msg.from;
+  if (!from || from.is_bot) return false;
+
+  const chat = msg.chat;
+  const isPrivate = chat.type === "private";
+  if (!isPrivate && !config.allowGroupChats) {
+    // 群聊里静默忽略，避免打扰也避免被扫
+    return false;
+  }
+  const chatId = chat.id;
+
+  // 命令可能带 @botname 后缀（群聊常见）
+  const raw = msg.text.trim();
+  const m = raw.match(/^(\/[A-Za-z_]+)(?:@\w+)?\s*([\s\S]*)$/);
+  if (!m) return false;
+  const cmd = m[1].toLowerCase();
+  const rest = (m[2] || "").trim();
+
+  // ── 限流 ────────────────────────────────────────────────────────────────
+  const rl = takeCommandToken(from.id);
+  if (!rl.ok) {
+    // 静默丢弃绝大多数超限请求，只偶尔提示，避免限流本身变成放大器
+    if (Math.random() < 0.1) {
+      await reply(chatId, `⏳ 命令过于频繁，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后再试。`);
+    }
+    return true;
+  }
+
+  // ── 记录活跃度 ──────────────────────────────────────────────────────────
+  const registered = getUser(from.id);
+  if (registered) {
+    touchUser(from.id, from.username, [from.first_name, from.last_name].filter(Boolean).join(" "));
+  }
+
+  // ── /bind ───────────────────────────────────────────────────────────────
+  if (cmd === "/bind") {
+    countCommand(from.id);
+    await doBind(chatId, from);
+    return true;
+  }
+
+  // ── 封禁 / 状态检查（必须排在 /admin 之前）──────────────────────────────
+  // 封禁是最强的否定信号，必须能覆盖一切提权来源。若放在 /admin 之后，一个
+  // 被封禁的账号只要还在 ADMIN_TELEGRAM_IDS 白名单里（例如先封禁、后补白名单），
+  // 就仍能进入管理面板。
+  if (registered) {
+    const usableEarly = checkUsable(registered);
+    if (!usableEarly.ok) {
+      await reply(
+        chatId,
+        usableEarly.reason === "banned"
+          ? "🚫 你的账号已被封禁。"
+          : `账号状态异常（${usableEarly.reason}），请联系管理员。`
+      );
+      return true;
+    }
+  }
+
+  // ── 管理员 ─────────────────────────────────────────────────────────────
+  if (cmd === "/admin") {
+    if (!isAdminUser(registered)) {
+      // 不回显「无权限」，避免探测
+      await reply(chatId, "未知命令。发送 /help 查看可用命令。");
+      return true;
+    }
+    countCommand(from.id);
+    await handleAdminCommand({ chatId, user: registered, from }, rest);
+    return true;
+  }
+
+  // ── 未注册用户 ──────────────────────────────────────────────────────────
+  if (!registered) {
+    if (PUBLIC_COMMANDS.has(cmd)) {
+      // 单用户模式下不再劝人注册，直接说明现状
+      if (!isMultiUserEnabled() && hasAnyUser()) {
+        await reply(
+          chatId,
+          "🔒 本实例为 <b>单用户模式</b>，仅供管理员使用。\n\n" +
+            "如果你是实例管理员，请检查是否用错了 Telegram 账号。"
+        );
+        return true;
+      }
+      await reply(
+        chatId,
+        "👋 本机器人提供 <b>NodeSeek 关键词监控</b>。\n\n" +
+          (isMultiUserEnabled()
+            ? "每个用户拥有独立的关键词与 AI 配置，互不干扰。\n\n发送 /bind 立即开通。"
+            : "发送 /bind 开始初始化（第一个绑定者将成为管理员）。")
+      );
+      return true;
+    }
+    await reply(chatId, "请先发送 /bind 开通账号。");
+    return true;
+  }
+
+  // ── 单用户模式：只有管理员能继续 ────────────────────────────────────────
+  // 放在这里而不是更早，是为了让被封禁/未注册的提示保持原有语义，
+  // 同时保证已注册的普通用户在模式切换后立即被挡住，但数据不丢。
+  if (!isMultiUserEnabled() && !isAdminUser(registered)) {
+    await reply(
+      chatId,
+      "🔒 <b>本实例已切换为单用户模式</b>\n\n" +
+        "你的关键词与配置都还保留着，待管理员重新开启多用户模式后即可继续使用。"
+    );
+    return true;
+  }
+
+  // ── 普通用户命令 ────────────────────────────────────────────────────────
+  countCommand(from.id);
+  const handled = await handleUserCommand({ chatId, user: registered, from }, cmd, rest);
+  if (!handled) {
+    await reply(chatId, `未知命令 <code>${cmd.replace(/[<>&]/g, "")}</code>。发送 /help 查看全部命令。`);
+  }
+  return true;
+}
+
+export { buildHelp, bumpKeywordRevision, sendMessage };

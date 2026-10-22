@@ -1,0 +1,114 @@
+# ============================================================================
+# NodeSeek 关键词监控 Bot — Docker Compose 部署
+#
+#   1. cp .env.example .env
+#   2. 编辑 .env（至少填 TELEGRAM_BOT_TOKEN 与 APP_MASTER_KEY）
+#   3. docker compose up -d
+#   4. docker compose logs -f
+#   5. 在 Telegram 给 Bot 发 /bind —— 第一个绑定的人就是管理员
+#
+# 运行模式由 .env 里的 MULTI_USER_ENABLED 决定：
+#   false（默认）= 单用户，只有管理员能用
+#   true        = 多用户，其他人可自助 /bind
+# 管理员可随时用 /admin multiuser on|off 在运行时切换，无需重启。
+#
+# 数据持久化默认使用**命名卷**，无需任何手工准备即可启动。
+# 若想改用宿主机目录，见下方 volumes 段的说明（必须先处理属主）。
+# ============================================================================
+
+services:
+  nodeseek-monitor:
+    # 用官方镜像（由 GitHub Actions 构建），也可以改成 build: .
+    image: ghcr.io/seameee/nodeseek-monitor:latest
+    # 想自己构建就注释掉上面那行，改用下面两行
+    # build:
+    #   context: .
+    container_name: nodeseek-monitor
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    volumes:
+      # SQLite 数据库与 WAL 文件都在 /data，必须持久化。
+      #
+      # 这里默认用命名卷。原因：容器以非 root 的 node(uid 1000) 运行，
+      # 而 Docker 用**绑定挂载**自动创建宿主机目录时，目录属主是 root，
+      # 非 root 进程写不进去，会直接报
+      #   Error: unable to open database file (ERR_SQLITE_ERROR, errcode 14)
+      # 命名卷则会从镜像继承 /data 的属主（uid 1000），因此零配置可用。
+      - nodeseek-data:/data
+      #
+      # 想改成宿主机目录（便于直接备份、用 sqlite3 查看）就用下面这行替换上面，
+      # 但必须先把目录交给 uid 1000，否则容器会崩溃重启：
+      #   mkdir -p data && sudo chown -R 1000:1000 data
+      # - ./data:/data
+
+    # 只用于容器内健康检查与调试，不映射到宿主机
+    # 需要从宿主机查看状态时再打开下面两行
+    # ports:
+    #   - "127.0.0.1:8787:8787"
+
+    # ── 安全加固 ──────────────────────────────────────────────────────────
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # 只读根文件系统；需要写的地方显式挂出来
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    # ── 资源限制 ──────────────────────────────────────────────────────────
+    # CPU：`cpus` 是**容器能用的 CPU 数**（cgroup 配额），不是宿主机核数。
+    # worker 线程池会按 os.availableParallelism() 自动跟着它走：
+    #
+    #     cpus     可用 CPU   自动线程数
+    #     "1.0"       1          2
+    #     "2.0"       2          2
+    #     "3.0"       3          3
+    #     "4.0"       4          4
+    #
+    # 为什么默认给 1 核：本服务是 I/O 密集的（等 RSS、等 Telegram、等 AI），
+    # CPU 只在解析 XML 和跑关键词正则时短暂忙一下。1 核足够常规规模使用，
+    # 也不会跟同机的其它服务抢资源 —— 默认值应该保守，需要的人自己调大。
+    #
+    # 什么时候该调大（实测 2000 用户 × 20 关键词、一轮 30 帖）：
+    #
+    #     cpus      匹配阶段     真实节奏一轮
+    #     "1.0"     3180ms       3042ms
+    #     "2.0"     1437ms       1483ms
+    #
+    # 从 1 核放到 2 核，这一阶段快约 2 倍（正好等于配额翻倍），收益很直接。
+    # 用户数到千级、或关键词是大列表正则时，建议给到 2~4 核。
+    #
+    # 两个坑：
+    #   · cpus 是 cgroup 配额，**不会**让 os.cpus() 变小 —— 它照样报宿主机
+    #     核数。所以线程数绝不能按 os.cpus() 取（见 config.js 的说明），
+    #     否则会在 1 核配额里开 4 个线程互相抢（实测 452ms → 3180ms）。
+    #   · 给满（如 "4.0"）时，突发流量下本服务可以和同机其它容器争满 4 核。
+    #     共享机器上请按实际情况留余量。
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  nodeseek-data:
+
