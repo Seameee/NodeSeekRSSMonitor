@@ -1032,7 +1032,7 @@ async function handleCommand(env, message) {
       al +
       `⏱ 轮询间隔：Cron 每分钟\n` +
       `🚦 防洪上限：10 条/轮\n` +
-      `🔄 已初始化：${ini ? "是" : "否（首轮后完成）"}\n` +
+      `🔄 已轮询过：${ini ? "是" : "否（下一轮开始推送）"}\n` +
       `📈 连续失败：${failCount} 次\n\n` +
       `🌐 RSS 数据源（✓主源）：\n${sources}`
     );
@@ -1179,12 +1179,16 @@ async function pollRSS(env) {
 
   if (!entries.size) return;
 
-  // 首次运行：静默初始化
+  // 首轮不做特殊处理：与 Docker 版保持一致，直接进入关键词匹配。
+  //
+  // 这里原先有一段「首次运行静默标记全部帖子」的逻辑，作用是避免部署后立刻
+  // 被历史帖子刷屏。但它与 Docker 版行为不一致，同一个关键词在两个版本上
+  // 表现不同，容易误判成 bug。现已统一：首轮同样会推送当前 feed 中命中的帖子。
+  //
+  // 需要抑制首轮推送时，先只加一个精确的关键词，或临时用 /dnd on 暂停。
   if (st["initialized"] !== "true") {
-    console.log(`首次轮询，静默标记 ${entries.size} 篇帖子`);
-    await markSeen(db, [...entries.keys()]);
+    // 仅记录一个标记，供 /status 展示，不再影响推送行为
     await setSetting(db, "initialized", "true");
-    return;
   }
 
   // 匹配

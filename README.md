@@ -2,7 +2,7 @@
 
 [![Node](https://img.shields.io/badge/node-24.22.1-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-186%20passing-brightgreen?style=flat-square)](server/test)
+[![Tests](https://img.shields.io/badge/tests-188%20passing-brightgreen?style=flat-square)](server/test)
 [![Registry](https://img.shields.io/badge/ghcr.io-nodeseek--monitor-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/Seameee/packages/container/nodeseek-monitor)
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -139,8 +139,6 @@ image: ghcr.io/seameee/nodeseek-monitor:latest
 
 同一台机器上只能运行一份。compose 中固定了 `container_name: nodeseek-monitor`，再次部署会因容器名重复而失败，报错为 `Conflict. The container name "/nodeseek-monitor" is already in use`。确需多实例时，需同时修改 `container_name`、卷名和数据目录。
 
-若 `docker compose up` 报 `401 Unauthorized` 或 `denied`，说明 GHCR 上的包不是公开的。容器包不会自动继承仓库可见性，需要手动设为 Public：`https://github.com/users/Seameee/packages/container/nodeseek-monitor/settings` → Visibility → Public。改完无需重新构建。
-
 也可以改为源码构建：
 
 ```bash
@@ -167,7 +165,7 @@ Workers 版（`worker.js`）是单用户部署，运行在 Cloudflare 边缘，�
 | 调度 | 进程内定时器 | Cron Trigger |
 | 命令 | 完整命令集，含 `/bind`、`/ai`、`/admin` | 无 `/bind`、`/ai`、`/admin` |
 | AI 摘要 | 每个用户在 Telegram 内自带 Key | 通过环境变量统一配置 |
-| 首轮行为 | 推送当前约 20 条帖子 | 静默标记，不推送 |
+| 首轮行为 | 推送当前约 20 条帖子 | 同左 |
 
 Workers 版需要 D1 数据库绑定、一个 Cron Trigger 和若干环境变量。仓库内没有附带 `wrangler.toml`，因为数据库 ID 与绑定需与实际账号对应，无法预先写死。下面给出完整的配置内容。
 
@@ -253,7 +251,7 @@ curl -s https://<worker名>.<子域>.workers.dev/setup
 
 返回内容应包含 `"database": "ok"` 与 Telegram 的 Webhook 注册结果。若 `webhook` 部分报错，通常是因为 `TELEGRAM_BOT_TOKEN` 未设置或填写错误。
 
-初始化完成后，Cron Trigger 会每分钟触发一次轮询。首次轮询只做静默标记，不会推送历史帖子。
+初始化完成后，Cron Trigger 会每分钟触发一次轮询。首轮即会按关键词匹配当前 feed 并推送命中的帖子，与 Docker 版一致；不希望立刻收到推送时，可先只加一个精确的关键词，或临时用 `/dnd on` 暂停。
 
 在 Telegram 私聊 Bot 发送 `/status` 确认部署正常。
 
@@ -717,7 +715,7 @@ docker compose exec nodeseek-monitor curl -s localhost:8787/healthz | head
 | 没有 AI 摘要 | 用 `/ai status` 查看配置，`/ai test` 查看上游报错，日志搜索 `[ai]`，并确认该帖有正文 |
 | 日志出现 `API Key 无法解密` | `APP_MASTER_KEY` 被修改过。需让该用户重新执行 `/ai set` |
 | 容器反复重启并报 `unable to open database file` | 使用绑定挂载但目录属主为 root。执行 `sudo chown -R 1000:1000 data`，或改回命名卷 |
-| 拉镜像报 `401 Unauthorized` 或 `denied` | GHCR 包不是公开的，见[预构建镜像与源码构建](#预构建镜像与源码构建) |
+| 拉镜像报 `401 Unauthorized` 或 `denied` | 当前网络或镜像代理未通过 GHCR 鉴权。可改用源码构建，见[预构建镜像与源码构建](#预构建镜像与源码构建) |
 | 报 `Conflict. The container name ... is already in use` | 本机已有一份在运行。同一台机器只能运行一份，或修改 `container_name` 与卷名 |
 | 他人 `/bind` 提示单用户模式 | 这是默认行为。执行 `/admin multiuser on`，或在 `.env` 中设置 `MULTI_USER_ENABLED=true` |
 | 自己不再是管理员 | 被其他账号抢先认领。在 `.env` 中填写 `ADMIN_TELEGRAM_IDS=你的ID` 后重启 |
@@ -781,7 +779,7 @@ docker exec nodeseek-monitor node --version
 ```
 ├── server/                    ← Docker 版全部内容
 │   ├── src/                   ← 20 个模块，零第三方依赖，全部使用 Node 内置能力
-│   ├── test/                  ← 19 个测试文件，186 项
+│   ├── test/                  ← 19 个测试文件，188 项
 │   ├── Dockerfile             ← 多阶段构建，node:24.22.1-alpine，非 root
 │   ├── docker-compose.yml     ← 含安全加固与资源限制
 │   └── .env.example           ← 环境变量模板
@@ -829,7 +827,7 @@ cd server && node --check src/*.js && node --test test/*.test.js
 | 性能 | worker 线程池与 ReDoS 硬超时、水位线去重、AI 跨用户拍平、发送令牌桶 |
 | 安全 | AES-256-GCM 加密 Key、日志脱敏、SSRF 词法校验、容器加固 |
 | 勿扰模式 | 按用户暂停推送、定时与每日时段、跨零点与时区处理、补看 |
-| 工程 | 186 项测试、可复跑基准脚本、多架构 CI 构建 |
+| 工程 | 188 项测试、可复跑基准脚本、多架构 CI 构建 |
 
 ### 授权状态
 

@@ -368,3 +368,33 @@ test("Worker 备用源：能从 Telegram 转发里提取 NodeSeek 原始链接",
   assert.match(all, /post-777001-1/, `推送里应出现 NodeSeek 原始链接，实际：${all.slice(0, 200)}`);
   assert.doesNotMatch(all, /t\.me\/nodeseekc\/12345/, "不应把 Telegram 转发链接当作帖子地址");
 });
+
+// ─── 首轮行为：与 Docker 版一致，不做静默初始化 ────────────────────────────
+
+test("Worker 首轮：直接按关键词推送，不再静默标记", async () => {
+  // 全新数据库，不预置 initialized —— 模拟刚部署完的第一次轮询
+  env.DB = new MockD1();
+  await cmd("/add 绿云");
+
+  const sent = await poll([
+    { id: 995001, title: "【出】绿云 首轮命中测试 1" },
+    { id: 995002, title: "【出】绿云 首轮命中测试 2" },
+  ]);
+
+  assert.equal(sent.length, 2, `首轮应推送 2 条，实际 ${sent.length} 条`);
+  const all = sent.map((s) => s.text).join("\n");
+  assert.match(all, /首轮命中测试/, "推送内容应包含命中标题");
+});
+
+test("Worker 首轮：不命中关键词的帖子不推送", async () => {
+  env.DB = new MockD1();
+  await cmd("/add 绿云");
+
+  const sent = await poll([
+    { id: 995101, title: "【出】搬瓦工 无关内容" },
+    { id: 995102, title: "【出】绿云 应当命中" },
+  ]);
+
+  assert.equal(sent.length, 1, `只应推送命中的 1 条，实际 ${sent.length} 条`);
+  assert.match(sent[0].text, /应当命中/);
+});
