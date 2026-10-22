@@ -354,6 +354,37 @@ cd server && docker compose up -d --build
 - 勿扰期间**跳过 AI 摘要**：消息都不发，摘要没人看，却要真实扣用户的上游费用。
 - `/history` **不显示**被拦下的帖子（它们从未发出，不能算「推送过」）；补看走 `/dnd backlog`，两条路径语义分开。
 - 后台迁移：老库升级时会自动 `ALTER TABLE` 补齐字段并打日志，**幂等**，不影响已有用户（默认 `off`）。
+- **只影响自己**：勿扰是每个用户各自的设置，管理员开了也不会影响其他用户（有测试钉住）。
+- Worker 版（`worker.js`）也提供同一套 `/dnd` 与 `/dnd backlog`。它是单用户部署，状态存在 `settings` 里。
+
+---
+
+## Node 版本与安全更新
+
+基础镜像**钉到具体补丁号**：`node:24.22.1-alpine`。
+
+2026-10-21 的 Node.js 安全公告（[原文](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)）修复了 4 个 **HIGH** 级问题，修复版本为 **24.22.1**：
+
+| CVE | 问题 |
+| --- | --- |
+| CVE-2026-111497 | Brotli 解码器越界写，可导致远程代码执行 |
+| CVE-2026-105482 | `dns.resolve` 截断含 NUL 字符的名称 |
+| CVE-2026-105483 | IP 写成全角数字时 TLS 主机名校验被绕过 |
+| CVE-2026-106069 | 主机名宽松解析成 IP 时 TLS 证书校验被绕过 |
+
+**为什么不用浮动的 `24-alpine`**：浮动 tag 通常能跟着上移，但构建结果不可复现 —— 某天基础镜像缓存或镜像源滞后，就会悄悄用回带洞的版本，而 CI 是绿的、看不出异常。钉住补丁号后，升级是一次显式的 diff，可以审计。
+
+升级方式：改 `Dockerfile` 里的 `ARG NODE_VERSION`，先确认 tag 存在：
+
+```bash
+docker run --rm node:24.22.1-alpine node --version   # 应输出 v24.22.1
+```
+
+确认容器实际版本：
+
+```bash
+docker exec nodeseek-monitor node --version
+```
 
 ---
 
@@ -620,7 +651,7 @@ docker run -d --name nodeseek-monitor \
   ghcr.io/seameee/nodeseek-monitor:latest
 ```
 
-不用 Docker 直接跑（需要 Node.js **22.5+**，用到内置 `node:sqlite`，**无需 `npm install`**）：
+不用 Docker 直接跑（需要 Node.js **22.13+**，用到内置 `node:sqlite`，**无需 `npm install`**）：
 
 ```bash
 cd server
@@ -639,7 +670,7 @@ node src/index.js
 ├── server/                    ← Docker 版全部内容
 │   ├── src/                   ← 19 个模块，零第三方依赖（全用 Node 内置）
 │   ├── test/                  ← 16 个测试文件，124 项
-│   ├── Dockerfile             ← 多阶段构建，node:24-alpine，非 root
+│   ├── Dockerfile             ← 多阶段构建，node:24.22.1-alpine，非 root
 │   ├── docker-compose.yml     ← 含安全加固与资源限制
 │   └── .env.example           ← 环境变量模板（写得很细）
 ├── .github/workflows/docker.yml  ← 多架构构建并推送 GHCR
