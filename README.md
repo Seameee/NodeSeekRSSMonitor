@@ -4,10 +4,9 @@
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen?style=flat-square)](server/test)
 [![Registry](https://img.shields.io/badge/ghcr.io-nodeseek--monitor-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/Seameee/packages/container/nodeseek-monitor)
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
 轮询 NodeSeek 的 RSS，新帖标题命中关键词时推送一条 Telegram 通知，可选附 AI 摘要。服务跑在自己的服务器上，支持多用户：任何人在 Telegram 里发 `/bind` 即可开通，各自的关键词与 AI 配置互不可见。
-
-本分支（`docker`）是 Docker 多用户版。Cloudflare Workers 单用户版位于 `main` 分支。
 
 本项目派生自 [Roddy-D/NodeSeekRSSMonitor](https://github.com/Roddy-D/NodeSeekRSSMonitor)，署名与授权范围见[来源与致谢](#来源与致谢)。
 
@@ -38,6 +37,13 @@
 ### 启动步骤
 
 **1. 拉取代码**
+
+```bash
+git clone https://github.com/Seameee/NodeSeekRSSMonitor.git
+cd NodeSeekRSSMonitor/server
+```
+
+如果 `server/` 目录不存在，说明默认分支尚未包含 Docker 版代码，此时指定分支再克隆：
 
 ```bash
 git clone -b docker https://github.com/Seameee/NodeSeekRSSMonitor.git
@@ -119,7 +125,7 @@ docker compose ps     # 应显示 healthy
 可复制的部署指令：
 
 ```
-部署这个项目：git clone -b docker https://github.com/Seameee/NodeSeekRSSMonitor.git && cd NodeSeekRSSMonitor/server && cp .env.example .env，然后在 .env 里填 TELEGRAM_BOT_TOKEN（向我索取）、APP_MASTER_KEY 用 openssl rand -hex 32 生成、MULTI_USER_ENABLED=true，最后 docker compose up -d，确认 docker compose ps 显示 healthy。
+部署这个项目：git clone https://github.com/Seameee/NodeSeekRSSMonitor.git（若 server/ 不存在则加 -b docker）&& cd NodeSeekRSSMonitor/server && cp .env.example .env，然后在 .env 里填 TELEGRAM_BOT_TOKEN（向我索取）、APP_MASTER_KEY 用 openssl rand -hex 32 生成、MULTI_USER_ENABLED=true，最后 docker compose up -d，确认 docker compose ps 显示 healthy。
 ```
 
 ### 预构建镜像与源码构建
@@ -662,7 +668,7 @@ docker exec nodeseek-monitor node --version
 │   ├── docker-compose.yml     ← 含安全加固与资源限制
 │   └── .env.example           ← 环境变量模板
 ├── .github/workflows/docker.yml  ← 多架构构建并推送 GHCR
-├── worker.js                  ← Workers 版，main 分支的内容，本分支保留但不使用
+├── worker.js                  ← Cloudflare Workers 单用户版
 ├── proxy-server*.js           ← 可选的反向代理辅助工具
 ├── LICENSE                    ← MIT，仅覆盖本仓库新增与修改部分
 └── NOTICE                     ← 上游来源与授权范围划分
@@ -723,4 +729,3 @@ cd server && node --check src/*.js && node --test test/*.test.js
 
 感谢 [Roddy-D](https://github.com/Roddy-D) 公开的初始实现。本项目的通知排版、AI 摘要与性能优化，都建立在它提供的骨架之上。
 
-[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
