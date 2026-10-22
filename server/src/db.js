@@ -316,14 +316,22 @@ export function dndSinceOf(user) {
 }
 
 /**
- * 「已看完」：把锚点推到此刻。
+ * 「已看完」：把锚点推到此刻**之后 1 秒**。
  *
- * 不能简单地把 dnd_since 置 NULL —— dndSinceOf 在无锚点时会兜底成「24 小时前」，
- * 于是下一次 /dnd backlog 又把刚看过的全列出来，用户会以为清空没生效。
- * 推到此刻才是「从现在起重新累计」的正确语义。
+ * 两个坑，都是实际踩过的：
+ *
+ * 1. 不能把 dnd_since 置 NULL —— dndSinceOf 在无锚点时会兜底成「24 小时前」，
+ *    于是下一次 /dnd backlog 又把刚看过的全列出来，用户会以为清空没生效。
+ *
+ * 2. 不能只推到「此刻」。查询条件是 `sent_at >= since`（含等号），而 ISO 时间戳
+ *    只到毫秒，同一毫秒内写入的命中会被算进来。更现实的是：用户看到补看列表后
+ *    立刻发 --clear，期间刚好又来一轮推送，那批新命中就落在同一秒甚至同一毫秒，
+ *    结果「刚清空又冒出来」。往前推 1 秒把这个窗口让开 —— 补看是给人看的，
+ *    早 1 秒的边界误差无关紧要，而「清了还显示」会让人以为功能坏了。
  */
 export function markBacklogSeen(telegramId) {
-  return prep("UPDATE users SET dnd_since=? WHERE telegram_id=?").run(now(), telegramId).changes;
+  const anchor = new Date(Date.now() + 1000).toISOString();
+  return prep("UPDATE users SET dnd_since=? WHERE telegram_id=?").run(anchor, telegramId).changes;
 }
 
 /** 设置用户时区（影响 window 模式的判定与文案显示） */
