@@ -627,8 +627,8 @@ async function cmdAi(ctx, rest) {
 function dndUsageText() {
   return (
     "🔕 <b>勿扰模式（暂停推送）</b>\n\n" +
-    "开启后<b>暂停推送</b>，消息完全不发——没有声音、没有通知栏弹窗、没有未读。\n" +
-    "期间命中的帖子会<b>记录下来</b>，用 <code>/dnd backlog</code> 补看，一条都不会丢。\n\n" +
+    "开启后<b>暂停推送</b>：消息不发送，没有声音、没有通知栏弹窗，也不产生未读。\n" +
+    "期间命中的帖子会被记录，可用 <code>/dnd backlog</code> 补看。\n\n" +
     "· <code>/dnd 2h</code> — 暂停 2 小时，到点自动恢复\n" +
     "· <code>/dnd 90m</code> — 暂停 90 分钟（也支持 <code>1d</code>、<code>1.5h</code>）\n" +
     "· <code>/dnd 23:00-08:00</code> — 每天这个时段暂停，可跨零点\n" +
@@ -690,7 +690,7 @@ async function cmdDnd(ctx, rest) {
       chatId,
       `🔕 <b>勿扰模式</b>：${st.active ? "暂停推送中" : "未开启"}\n` +
         `<b>状态</b>：${st.text}${backlogLine}\n\n` +
-        `<i>开启后推送完全不发，用 /dnd backlog 补看。用 /dnd 2h 这类写法快速开启。</i>`
+        `<i>开启后推送完全停止，期间命中的帖子可用 /dnd backlog 补看。</i>`
     );
   }
 

@@ -1,83 +1,79 @@
-# NodeSeek 关键词监控 Bot（Docker 版）
+# NodeSeek 关键词监控 Bot
 
-轮询 NodeSeek 的 RSS，**新帖标题命中你设的关键词，就推一条 Telegram 通知**，可选 AI 摘要。
+[![Node](https://img.shields.io/badge/node-24.22.1-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen?style=flat-square)](server/test)
+[![Registry](https://img.shields.io/badge/ghcr.io-nodeseek--monitor-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/Seameee/packages/container/nodeseek-monitor)
 
-跑在你自己的服务器上，支持多用户：任何人 `/bind` 就能自助开通，各自的关键词与 AI 配置互不可见。
+轮询 NodeSeek 的 RSS，新帖标题命中关键词时推送一条 Telegram 通知，可选附 AI 摘要。服务跑在自己的服务器上，支持多用户：任何人在 Telegram 里发 `/bind` 即可开通，各自的关键词与 AI 配置互不可见。
 
-> 本分支（`docker`）只包含 Docker 多用户版。Cloudflare Workers 单用户版在 `main` 分支。
-> 本项目派生自 [Roddy-D/NodeSeekRSSMonitor](https://github.com/Roddy-D/NodeSeekRSSMonitor)，署名与授权见文末[来源与致谢](#来源与致谢)。
+本分支（`docker`）是 Docker 多用户版。Cloudflare Workers 单用户版位于 `main` 分支。
 
----
+本项目派生自 [Roddy-D/NodeSeekRSSMonitor](https://github.com/Roddy-D/NodeSeekRSSMonitor)，署名与授权范围见[来源与致谢](#来源与致谢)。
 
-## 一句话部署（给 AI Agent）
+## 目录
 
-如果你是在用 Claude Code / Codex / Cursor 这类 AI agent 部署本项目，把下面这句话连同仓库地址一起丢给它即可：
-
-> **克隆 `https://github.com/Seameee/NodeSeekRSSMonitor.git` 的 `docker` 分支，进入 `server/`，从 `.env.example` 复制出 `.env` 并填好 `TELEGRAM_BOT_TOKEN`（向用户索取）与 `APP_MASTER_KEY`（用 `openssl rand -hex 32` 生成），设置 `MULTI_USER_ENABLED=true`，然后执行 `docker compose up -d`，等 `docker compose ps` 显示 `healthy` 后，把 `.env` 里的 `APP_MASTER_KEY` 备份提醒和「第一个发 `/bind` 的人会成为管理员」告知用户。**
-
-可复制版：
-
-```
-部署这个项目：git clone -b docker https://github.com/Seameee/NodeSeekRSSMonitor.git && cd NodeSeekRSSMonitor/server && cp .env.example .env，然后在 .env 里填 TELEGRAM_BOT_TOKEN（问我）、APP_MASTER_KEY 用 openssl rand -hex 32 生成、MULTI_USER_ENABLED=true，最后 docker compose up -d，确认 docker compose ps 显示 healthy。
-```
-
-Agent 需要知道的三个硬约束（写在这里省得它踩坑）：
-
-1. **`APP_MASTER_KEY` 不可事后更改** —— 改了所有用户已存的 API Key 全部解不开。生成一次，备份好。
-2. **数据在命名卷 `nodeseek-data` 里**，`docker compose down` 不会删数据，`down -v` 会。别乱加 `-v`。
-3. **不要设 `WORKER_POOL_SIZE`** —— 留空时它按 `os.availableParallelism()`（读 cgroup 限额）自动取值，手动设反而容易配错。
-
----
+- [部署](#部署)
+- [运行模式](#运行模式)
+- [命令](#命令)
+- [匹配规则](#匹配规则)
+- [AI 摘要](#ai-摘要)
+- [勿扰模式](#勿扰模式)
+- [安全与隐私](#安全与隐私)
+- [环境变量](#环境变量)
+- [性能与容量](#性能与容量)
+- [运维](#运维)
+- [Node 版本与安全更新](#node-版本与安全更新)
+- [仓库结构](#仓库结构)
 
 ## 部署
 
 ### 前置条件
 
 - Docker 20.10+ 与 Docker Compose v2（`docker compose` 命令）
-- 1 核 CPU 起（compose 默认 `cpus: "1.0"`，见下方[CPU 与并发](#cpu-与并发)）
-- 内存 128 MB 起（默认限制 512 MB）
+- 1 核 CPU、128 MB 内存起（compose 默认 `cpus: "1.0"`、内存上限 512 MB）
 - 能访问 `api.telegram.org` 与 `rss.nodeseek.com`
-- 一个 Bot Token：[@BotFather](https://t.me/BotFather) → `/newbot`
+- 一个 Bot Token，从 [@BotFather](https://t.me/BotFather) 用 `/newbot` 获取
 
-### 三步启动
+### 启动步骤
 
-**1. 拉代码**
+**1. 拉取代码**
 
 ```bash
 git clone -b docker https://github.com/Seameee/NodeSeekRSSMonitor.git
 cd NodeSeekRSSMonitor/server
 ```
 
-**2. 配置 `.env`**
+**2. 生成 `.env`**
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 ```
 
-至少要改这两项：
+必填两项：
 
 ```bash
 # 从 @BotFather 获取
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 
-# 主密钥，加密用户 API Key 用。生成后立刻备份，改动即不可逆
+# 用于加密用户 API Key。生成后立即备份，改动即不可逆
 APP_MASTER_KEY=
 ```
 
-`APP_MASTER_KEY` 用这条命令直接写进去：
+主密钥可用下面这条命令直接写入 `.env`：
 
 ```bash
 sed -i "s|^APP_MASTER_KEY=.*|APP_MASTER_KEY=$(openssl rand -hex 32)|" .env
 ```
 
-想开放给多人用，再加一行：
+要开放给多人使用，再加一行：
 
 ```bash
 MULTI_USER_ENABLED=true
 ```
 
-> 默认是 `false`（单用户，只有管理员能用）。**开放注册前请先自己 `/bind` 认领管理员**，否则先找到这个 Bot 的陌生人会变成管理员。
+默认为 `false`，即单用户模式，只有管理员可用。开放注册前应先用自己的账号 `/bind` 完成认领，否则第一个找到这个 Bot 的陌生人会成为管理员。
 
 **3. 启动**
 
@@ -86,14 +82,14 @@ docker compose up -d
 docker compose logs -f
 ```
 
-看到这两行就是正常：
+日志出现以下两行即为正常启动：
 
 ```
 [health] 健康检查监听 :8787/healthz
 [poller] 本轮完成：20 帖 / 0 用户 / 推送 0 条 / 摘要 0 条 / 耗时 220ms
 ```
 
-`Ctrl+C` 退出日志（容器继续在后台跑）。确认状态：
+按 `Ctrl+C` 退出日志，容器继续在后台运行。确认容器状态：
 
 ```bash
 docker compose ps     # 应显示 healthy
@@ -101,59 +97,69 @@ docker compose ps     # 应显示 healthy
 
 **4. 认领管理员**
 
-在 Telegram 私聊你的 Bot，发 `/bind`。**第一个绑定的人自动成为管理员。**
+在 Telegram 私聊你的 Bot，发送 `/bind`。第一个绑定的人自动成为管理员。
 
 ```
 /add 绿云              # 添加关键词
-/list                  # 查看
+/list                  # 查看关键词
 /ai set sk-xxx         # 可选，配置 AI 摘要
-/admin                 # 管理面板（仅管理员）
+/admin                 # 管理面板，仅管理员
 ```
 
-> ⚠️ **新部署的第一轮会把当前 RSS 里的 20 条帖子当作新帖**（因为还没有「已见」水位线）。所以别一开始就加大词——先加一个精确词，看一轮推送长什么样再往上加。
+新部署的第一轮会把当前 RSS 里的约 20 条帖子当作新帖，因为此时还没有「已见」水位线。建议先加一个精确的词观察推送格式，再逐步放宽。
 
----
+### 关于 AI Agent 部署
 
-## 用预构建镜像，还是自己构建
+如果由 AI agent 执行部署，需要遵守三条约束：
 
-默认用 GitHub Actions 构建好的镜像，多架构（amd64/arm64）：
+1. `APP_MASTER_KEY` 不可事后更改。改动后所有用户已存的 API Key 全部无法解密。生成一次并备份。
+2. 数据位于命名卷 `nodeseek-data`。`docker compose down` 不删数据，`down -v` 会删除。
+3. 不要设置 `WORKER_POOL_SIZE`。留空时按 `os.availableParallelism()`（读取 cgroup 限额）自动取值，手动指定容易出现线程数与 CPU 配额不匹配。
+
+可复制的部署指令：
+
+```
+部署这个项目：git clone -b docker https://github.com/Seameee/NodeSeekRSSMonitor.git && cd NodeSeekRSSMonitor/server && cp .env.example .env，然后在 .env 里填 TELEGRAM_BOT_TOKEN（向我索取）、APP_MASTER_KEY 用 openssl rand -hex 32 生成、MULTI_USER_ENABLED=true，最后 docker compose up -d，确认 docker compose ps 显示 healthy。
+```
+
+### 预构建镜像与源码构建
+
+默认使用 GitHub Actions 构建的镜像，同时提供 amd64 与 arm64：
 
 ```yaml
 image: ghcr.io/seameee/nodeseek-monitor:latest
 ```
 
-> ⚠️ **同一台机器上只能跑一份。** compose 里写死了 `container_name: nodeseek-monitor`，再部署一份会因为容器名重复而失败（报 `Conflict. The container name "/nodeseek-monitor" is already in use`）。确实需要多实例时，把 `container_name` 改成别的名字、并把 compose 里的卷名和数据目录一并区分开。
+同一台机器上只能运行一份。compose 中固定了 `container_name: nodeseek-monitor`，再次部署会因容器名重复而失败，报错为 `Conflict. The container name "/nodeseek-monitor" is already in use`。确需多实例时，需同时修改 `container_name`、卷名和数据目录。
 
-**如果 `docker compose up` 报 `401 Unauthorized` / `denied`**：说明 GHCR 上的包不是公开的。容器包**不会**自动继承仓库可见性，需要作者手动设为 Public：
+若 `docker compose up` 报 `401 Unauthorized` 或 `denied`，说明 GHCR 上的包不是公开的。容器包不会自动继承仓库可见性，需要手动设为 Public：`https://github.com/users/Seameee/packages/container/nodeseek-monitor/settings` → Visibility → Public。改完无需重新构建。
 
-`https://github.com/users/Seameee/packages/container/nodeseek-monitor/settings` → Visibility → Public
-
-改完不需要重新构建。不想公开也没关系，改用源码构建（源码仓库是公开的）：
+也可以改为源码构建：
 
 ```bash
 # 方式一：本地克隆后构建
 cd server && docker compose up -d --build
-
-# 方式二：让 compose 直接拉源码构建
-#   把 compose 里的 image: 换成：
-#     build:
-#       context: https://github.com/Seameee/NodeSeekRSSMonitor.git#docker:server
 ```
 
----
+```yaml
+# 方式二：让 compose 直接拉取源码构建
+# 把 compose 里的 image: 换成：
+build:
+  context: https://github.com/Seameee/NodeSeekRSSMonitor.git#docker:server
+```
 
-## 单用户 vs 多用户
+## 运行模式
 
-由 `MULTI_USER_ENABLED` 决定，**默认单用户**：
+由 `MULTI_USER_ENABLED` 决定，默认为单用户模式。
 
 | | 单用户（默认） | 多用户 |
 | --- | --- | --- |
-| 谁能用 | 只有管理员 | 管理员 + 所有 `/bind` 的用户 |
-| `/bind` | 仅第一个用户（认领管理员） | 任何人都可自助开通 |
+| 可用范围 | 只有管理员 | 管理员与所有 `/bind` 用户 |
+| `/bind` | 仅第一个用户，即认领管理员 | 任何人可自助开通 |
 | 配额 | 管理员不受限 | 普通用户受配额限制 |
 | 关键词与 AI 配置 | 各自独立 | 各自独立 |
 
-**不用重启就能切换**，管理员随时可用：
+切换无需重启，管理员随时可执行：
 
 ```
 /admin multiuser on       # 开放给其他人
@@ -161,33 +167,31 @@ cd server && docker compose up -d --build
 /admin multiuser default  # 清除覆盖，回到 .env 的设置
 ```
 
-切换的三条保证：**数据不丢**（关闭不删任何用户的关键词与配置）、**立即生效**（普通用户命令被拒、当轮起不再推送）、**可逆**（重开后立刻恢复，无需重配）。
+切换有三条保证：数据不丢（关闭不删除任何用户的关键词与配置）、立即生效（普通用户命令被拒，当轮起不再推送）、可逆（重新开启后立即恢复，无需重新配置）。
 
-优先级：**管理员覆盖（存在库里，重启仍有效）> `.env` 的 `MULTI_USER_ENABLED`**。
+优先级为：管理员覆盖（存于数据库，重启后仍有效）优先于 `.env` 中的 `MULTI_USER_ENABLED`。
 
----
-
-## 命令一览
+## 命令
 
 ### 所有用户
 
 | 命令 | 说明 |
 | --- | --- |
-| `/bind` | 开通账号（自助注册） |
+| `/bind` | 开通账号 |
 | `/add <关键词> [版块] [--regex]` | 添加关键词 |
 | `/list` | 查看自己的关键词 |
-| `/remove <序号…\|关键词\|all>` | 删除（`/del` 同义），支持批量 |
+| `/remove <序号…\|关键词\|all>` | 删除，`/del` 同义，支持批量 |
 | `/pause <序号…\|关键词\|all>` | 暂停但不删除，支持批量 |
 | `/resume <序号…\|关键词\|all>` | 恢复，支持批量 |
-| `/categories` | 可用版块 |
+| `/categories` | 列出可用版块 |
 | `/ai set <key> [base_url]` | 配置 AI 密钥与地址 |
-| `/ai fallback <模型1,模型2>` | 模型链，第 1 个是主模型 |
-| `/ai num <minLen> <maxPerRound> <maxTokens> <timeoutMs>` | 调参 |
+| `/ai fallback <模型1,模型2>` | 配置模型链，第一个为主模型 |
+| `/ai num <minLen> <maxPerRound> <maxTokens> <timeoutMs>` | 调整摘要参数 |
 | `/ai prompt <提示词>` | 自定义摘要提示词 |
-| `/ai test` | 连通性测试（消耗 1 次配额） |
-| `/ai status` / `/ai on` / `/ai off` / `/ai clear` | 查看 / 开关 / 清除 |
-| `/dnd <时长\|时段\|on\|off\|backlog\|tz>` | 勿扰模式：暂停推送 + 补看（`/mute` 同义） |
-| `/status` | 状态与今日用量（含勿扰状态） |
+| `/ai test` | 连通性测试，消耗 1 次配额 |
+| `/ai status`、`/ai on`、`/ai off`、`/ai clear` | 查看、开关、清除配置 |
+| `/dnd <时长\|时段\|on\|off\|backlog\|tz>` | 勿扰模式，暂停推送并可补看，`/mute` 同义 |
+| `/status` | 状态与今日用量，含勿扰状态 |
 | `/history [数量]` | 最近推送记录 |
 | `/help` | 帮助 |
 
@@ -198,74 +202,74 @@ cd server && docker compose up -d --build
 | `/admin` | 管理面板 |
 | `/admin users [页码]` | 用户列表 |
 | `/admin find <ID\|用户名>` | 搜索用户 |
-| `/admin info <id>` | 用户详情（含用量、AI 状态） |
-| `/admin ban` / `/admin unban <id>` | 封禁 / 解封 |
+| `/admin info <id>` | 用户详情，含用量与 AI 状态 |
+| `/admin ban`、`/admin unban <id>` | 封禁、解封 |
 | `/admin quota <id> kw\|ai\|push <数值\|-1>` | 设置配额，`-1` 恢复默认，`ai` 设 `0` 为不限 |
-| `/admin note <id> <备注>` | 写备注 |
-| `/admin del <id>` | 删除用户及其**全部数据** |
+| `/admin note <id> <备注>` | 添加备注 |
+| `/admin del <id>` | 删除用户及其全部数据 |
 | `/admin stats` | 全局统计与运行时状态 |
-| `/admin multiuser on\|off\|default` | 运行模式开关 |
-| `/admin open on\|off` | 开关注册（仅多用户模式生效） |
-| `/admin audit` | 最近管理操作 |
+| `/admin multiuser on\|off\|default` | 切换运行模式 |
+| `/admin open on\|off` | 开关自助注册，仅多用户模式生效 |
+| `/admin audit` | 最近的管理操作 |
 
-### 使用示例
+### 示例
 
 ```
-/add 搬瓦工                     # 全部版块的「搬瓦工」
-/add 搬瓦工 trade               # 只看交易版
-/add 搬瓦工 trade,info          # 交易版与情报版（拆成 2 条，各占配额）
+/add 搬瓦工                     # 全部版块
+/add 搬瓦工 trade               # 仅交易版
+/add 搬瓦工 trade,info          # 交易版与情报版，拆成 2 条，各占配额
 /add 补货.*(CN2|GIA) --regex    # 正则，全部版块
 
-/remove 2                       # 删第 2 条
-/pause 绿云                     # 按关键词操作也行
+/remove 2                       # 删除第 2 条
+/pause 绿云                     # 按关键词名操作
 ```
 
 ### 批量操作
 
-`/remove`、`/pause`、`/resume` 共用同一套选择器，**一次可以处理多条**——关键词上限 20 条，而一条往往是几百字符的品牌名正则，逐条操作成本很高。
+`/remove`、`/pause`、`/resume` 共用同一套选择器，一次可处理多条。个人关键词上限为 20 条，而单条往往是几百字符的品牌名正则，逐条操作成本较高。
 
 ```
-/pause 3                        # 单条（和以前一样）
+/pause 3                        # 单条
 /pause 1 3 5                    # 多个序号，空格或逗号分隔
-/pause 1,3,5                    # 同上（中文逗号也认）
-/pause 1-5                      # 一个范围
-/pause 绿云 搬瓦工              # 按关键词名（不区分大小写）
+/pause 1,3,5                    # 同上，中文逗号亦可
+/pause 1-5                      # 范围
+/pause 绿云 搬瓦工              # 按关键词名，不区分大小写
 /pause all                      # 全部
 ```
 
-几种写法可以混用，比如 `/remove 1 kw4`。序号、范围、关键词名会**合并去重**后一次性处理，重复的序号只生效一次。
+多种写法可以混用，例如 `/remove 1 kw4`。序号、范围与关键词名会合并去重后一次性处理，重复的序号只生效一次。
 
-**关键词名本身含空格时**（比如 `绿云 补货`，或正则里的 `补货 .*(CN2|GIA)`），把整个名称原样打出来即可——匹配时会先尝试「整个参数」当一条完整名称，命中就按单条处理：
+关键词名本身含空格时（如 `绿云 补货`，或正则里的 `补货 .*(CN2|GIA)`），将整个名称原样写出即可。匹配时会先尝试把整个参数当作一条完整名称，命中则按单条处理：
 
 ```
 /pause 绿云 补货                 # 命中名为「绿云 补货」的那一条
 /pause 补货 .*(CN2|GIA)          # 正则含空格也能整体匹配
 ```
 
-结果会告诉你实际改了几条、剩几条，并列出受影响的关键词（长正则自动截断）。有越界或不存在的目标时，**有效的照样执行**，无效的单独列出来，不会因为一个错项把整批撤销：
+执行结果会说明改动条数、剩余条数，并列出受影响的关键词（长正则自动截断）。若选择器中有越界或不存在的目标，有效项照常执行，无效项单独列出，不会因单项错误撤销整批。
 
 ```
-✅ 已暂停 2 条
+已暂停 2 条
 
 · greencloud ·trade
 · 搬瓦工
 
-⚠️ 未处理：序号 99 不存在（共 5 条）
+未处理：序号 99 不存在（共 5 条）
 ```
 
-两个细节：
+两点需要留意：
 
-- **序号按执行前的列表计算。** `/remove 1 2` 删的是原来第 1、2 条，不会因为先删了第 1 条就把原第 3 条当第 2 条删掉。
-- **`/remove all` 需要二次确认**：第一次只回复「将删除全部 N 条」并给出 `/remove all confirm`，避免手滑清空一堆辛苦写好的正则。`/pause all`、`/resume all` 可逆，无需确认。
+- 序号按执行前的列表计算。`/remove 1 2` 删除的是原来的第 1、2 条，不会因先删除第 1 条而把原第 3 条当作第 2 条。
+- `/remove all` 需要二次确认：首次仅回复待删除数量并提示 `/remove all confirm`，避免误删积累的正则。`/pause all` 与 `/resume all` 可逆，无需确认。
 
-`/pause`、`/resume` 遇到本来就是目标状态的条目会跳过并说明，不会假装成功。
+`/pause`、`/resume` 遇到本就处于目标状态的条目会跳过并说明，不会虚报成功。
 
-**匹配规则要点：**
+## 匹配规则
 
-- **只匹配标题，不匹配正文。**
-- 子串模式**不区分大小写**；正则模式也自动带 `i` 标志（**不要写 `(?i)`**，JS 不支持，会报语法错误）。
-- 关键词之间是**「或」**关系。
-- 多版块会拆成多条记录，**各占一条关键词配额**。
+- 只匹配标题，不匹配正文。
+- 子串模式不区分大小写；正则模式自动带 `i` 标志。不要写 `(?i)`，JavaScript 不支持该语法，会报错。
+- 多个关键词之间是「或」关系。
+- 指定多个版块时会拆成多条记录，各占一条关键词配额。
 
 ### 可用版块
 
@@ -277,214 +281,175 @@ cd server && docker compose up -d --build
 | `dev` | Dev | `photo-share` | 贴图 |
 | `expose` | 曝光 | `sandbox` | 沙盒 |
 
----
+## AI 摘要
 
-## AI 摘要（可选）
+默认关闭，且不通过环境变量配置。每个用户使用自己的 API Key，在 Telegram 中设置。
 
-**默认关闭，且不通过环境变量配置。** 每个用户用自己的 Key，在 Telegram 里配。
-
-配了之后，每条推送多一句摘要，并标注**实际产出该摘要的模型**：
+配置后每条推送会多一句摘要，并标注实际产出该摘要的模型：
 
 ```
 /ai set sk-你的key https://api.deepseek.com/v1
-/ai fallback kimi-k2.6,deepseek-flash,qwen3.8-27b   # 第 1 个是主模型
+/ai fallback kimi-k2.6,deepseek-flash,qwen3.8-27b   # 第一个为主模型
 /ai test                                            # 验证连通性
 ```
 
 行为说明：
 
-- **回退是逐级的**：网络异常、非 2xx、返回内容为空，都会触发下一级；全失败只是没有摘要，**通知照常发**。
-- **正文为空的帖子跳过摘要**（约 20% 的帖子被作者设为「仅注册用户可见」，取不到正文），属正常行为。
-- 单条最坏耗时约 `(模型数) × timeoutMs`，配了回退链后建议把 `timeoutMs` 调小（如 `8000`）。
-- 推理型模型**别把 `max_tokens` 调太小**（默认 4000）：思考会吃光预算，表现为 HTTP 200 但内容为空。
+- 回退逐级进行。网络异常、非 2xx 响应、返回内容为空都会触发下一级；全部失败时只是没有摘要，通知照常发送。
+- 正文为空的帖子跳过摘要。约 20% 的帖子被作者设为「仅注册用户可见」，取不到正文，属于正常情况。
+- 单条最坏耗时约为 `模型数 × timeoutMs`。配置回退链后建议调小 `timeoutMs`，例如 `8000`。
+- 推理型模型的 `max_tokens` 不宜过小（默认 4000）。思考过程会耗光预算，表现为 HTTP 200 但内容为空。
 
-**没摘要时怎么查**，按顺序：
+摘要缺失时的排查顺序：
 
-1. `/ai status` —— 没配置就直接显示用法；配置了会显示链路和今日用量
-2. `/ai test` —— 直接报上游的错（401 是 Key 无效、404 是模型名或地址写错）
-3. 日志搜 `[ai]` —— 会打印 `HTTP 状态 + 上游响应前 160 字符`
-
----
+1. `/ai status`：未配置会直接显示用法，已配置会显示链路与今日用量
+2. `/ai test`：直接返回上游错误，401 为 Key 无效，404 为模型名或地址错误
+3. 日志搜索 `[ai]`：会打印 HTTP 状态与上游响应的前 160 字符
 
 ## 勿扰模式
 
-**暂停推送，但不丢消息。** 每个用户独立设置，互不影响，管理员也一样。
+暂停推送，但不丢消息。每个用户独立设置，互不影响，管理员同样适用。
 
 ```bash
 /dnd 2h                      # 暂停推送 2 小时，到点自动恢复
-/dnd 90m                     # 90 分钟（也支持 1d、1.5h、8小时、45分钟）
-/dnd 23:00-08:00             # 每天都暂停这个时段（可跨零点）
+/dnd 90m                     # 90 分钟，也支持 1d、1.5h、8小时、45分钟
+/dnd 23:00-08:00             # 每天该时段暂停，可跨零点
 /dnd on                      # 一直暂停，直到 /dnd off
 /dnd off                     # 立即恢复推送
 /dnd backlog                 # 补看期间错过的帖子
-/dnd backlog --clear         # 看完了，之后只显示新的
-/dnd tz Asia/Shanghai        # 设时区（定时段时用）
-/dnd                         # 查看当前状态（含错过了多少条）
+/dnd backlog --clear         # 看完后清空，之后只显示新的
+/dnd tz Asia/Shanghai        # 设置时区，定时段时使用
+/dnd                         # 查看当前状态与错过条数
 ```
 
-### 为什么是「暂停推送」而不是「静音发送」
+### 为什么用暂停推送而不是静音发送
 
-最初实现用的是 Bot API 的 `disable_notification`（静音发送）。**这个方案被实测否决了**：
+最初的实现使用 Bot API 的 `disable_notification` 参数。该方案经实测后被否决。
 
-官方对该参数的说明是「Users will receive a notification with no sound」——**声音没了，通知栏照样弹**。用户实际使用后反馈「依旧在提醒」，用一条静音消息 + 一条普通消息做对照，确认静音那条确实无声，但**通知还是会冒出来**。
+官方文档对该参数的说明是「Users will receive a notification with no sound」，即声音消失但通知照常弹出。实际使用反馈「依旧在提醒」，用一条静音消息与一条普通消息对照验证，确认静音消息确实无声，但通知仍会出现。
 
-所以改成完全不发。期间命中的帖子写入 `notifications` 表（`status='muted'`），用 `/dnd backlog` 补看。
+因此改为完全不发送。期间命中的帖子写入 `notifications` 表，状态为 `muted`，通过 `/dnd backlog` 补看。
 
-### 为什么做不到 Telegram 那种「灰色圆点、不进未读」
+### 无法实现 Telegram 客户端的「灰色圆点」
 
-「只显示灰色圆点标记有消息，但不进未读也不弹通知」对应 Telegram 客户端的**「归档并静音」**。那是**账号级的 chat 设置**，Bot API 没有任何权限去修改接收方的聊天状态——**任何 bot 都做不到**，不是实现限制。
+「只显示灰色圆点标记有新消息，不进未读也不弹通知」对应 Telegram 客户端的「归档并静音」。这是账号级的 chat 设置，Bot API 没有修改接收方聊天状态的权限，任何 bot 都无法做到，并非本项目的实现限制。
 
-想要那个效果，在 Telegram 里对 `@ns_kw_bot` 这个对话长按（或点顶部名字）选「**归档并静音**」，设一次永久生效。两者定位不同，可以并存：
+需要该效果时，在 Telegram 中对 Bot 会话长按或点击顶部名称，选择「归档并静音」，设置一次即长期有效。两种方式定位不同，可以并存：
 
-| 方案 | 消息送达 | 通知栏 | 未读圆点 | 需要设一次 |
+| 方案 | 消息送达 | 通知栏 | 未读标记 | 需事前设置 |
 | --- | --- | --- | --- | --- |
-| 客户端「归档并静音」 | ✅ | 不弹 | 灰色圆点 | 是（永久） |
-| `/dnd` 暂停推送 | ❌ 不发 | 不弹 | 无 | 否（可定时） |
+| 客户端「归档并静音」 | 是 | 不弹 | 灰色圆点 | 是，永久 |
+| `/dnd` 暂停推送 | 否，不发送 | 不弹 | 无 | 否，可定时 |
 
-### 三个容易忽略的细节
+### 实现细节
 
-- **跨零点时段**：`23:00-08:00` 指的是「23 点之后或早上 8 点之前」，凌晨那几小时必须算暂停。判定用「或」而不是简单的区间包含。
-- **时区必须单独存**：容器里通常是 UTC，而「23:00」指的是**用户本地钟点**。直接按 UTC 比较会让整个窗口平移 8 小时。默认 `Asia/Shanghai`，可用 `DND_TIMEZONE` 环境变量改，用户也能用 `/dnd tz` 覆盖自己的。
-- **补看锚点是「推到此刻」而不是清空**：`--clear` 若把锚点置空，兜底逻辑会退回「24 小时前」，刚看过的又全列出来，用户会以为清空没生效。
+- 跨零点时段：`23:00-08:00` 指 23 点之后或早上 8 点之前，凌晨几个小时同样计入。判定使用「或」而非区间包含。
+- 时区单独存储。容器内通常为 UTC，而 `23:00` 指用户本地钟点，直接按 UTC 比较会使整个窗口偏移 8 小时。默认 `Asia/Shanghai`，可用 `DND_TIMEZONE` 环境变量修改，用户也可用 `/dnd tz` 覆盖。
+- 补看的锚点指向「此刻之后 1 秒」而非清空。若置空，兜底逻辑会退回 24 小时前，刚看过的记录会重新列出，用户会以为清空未生效。
 
 ### 边界与限制
 
-- 单次暂停上限 **30 天**，最小 1 分钟；超出会提示而不是静默截断。
-- 起止时间相同的 `23:00-23:00` 会**拒收**——「整天暂停」和「没设置」两种解释都合理，用 `/dnd on` 表达才没有歧义。
-- 勿扰期间**跳过 AI 摘要**：消息都不发，摘要没人看，却要真实扣用户的上游费用。
-- `/history` **不显示**被拦下的帖子（它们从未发出，不能算「推送过」）；补看走 `/dnd backlog`，两条路径语义分开。
-- 后台迁移：老库升级时会自动 `ALTER TABLE` 补齐字段并打日志，**幂等**，不影响已有用户（默认 `off`）。
-- **只影响自己**：勿扰是每个用户各自的设置，管理员开了也不会影响其他用户（有测试钉住）。
-- Worker 版（`worker.js`）也提供同一套 `/dnd` 与 `/dnd backlog`。它是单用户部署，状态存在 `settings` 里。
-
----
-
-## Node 版本与安全更新
-
-基础镜像**钉到具体补丁号**：`node:24.22.1-alpine`。
-
-2026-10-21 的 Node.js 安全公告（[原文](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)）修复了 4 个 **HIGH** 级问题，修复版本为 **24.22.1**：
-
-| CVE | 问题 |
-| --- | --- |
-| CVE-2026-111497 | Brotli 解码器越界写，可导致远程代码执行 |
-| CVE-2026-105482 | `dns.resolve` 截断含 NUL 字符的名称 |
-| CVE-2026-105483 | IP 写成全角数字时 TLS 主机名校验被绕过 |
-| CVE-2026-106069 | 主机名宽松解析成 IP 时 TLS 证书校验被绕过 |
-
-**为什么不用浮动的 `24-alpine`**：浮动 tag 通常能跟着上移，但构建结果不可复现 —— 某天基础镜像缓存或镜像源滞后，就会悄悄用回带洞的版本，而 CI 是绿的、看不出异常。钉住补丁号后，升级是一次显式的 diff，可以审计。
-
-升级方式：改 `Dockerfile` 里的 `ARG NODE_VERSION`，先确认 tag 存在：
-
-```bash
-docker run --rm node:24.22.1-alpine node --version   # 应输出 v24.22.1
-```
-
-确认容器实际版本：
-
-```bash
-docker exec nodeseek-monitor node --version
-```
-
----
+- 单次暂停上限 30 天，最小 1 分钟。超出范围会提示，不会静默截断。
+- 起止时间相同的 `23:00-23:00` 会被拒收。「整天暂停」与「未设置」两种解释都成立，用 `/dnd on` 表达没有歧义。
+- 勿扰期间跳过 AI 摘要。消息不发送，摘要无人查看，但仍会消耗用户的上游费用。
+- `/history` 不显示被拦下的帖子，它们从未发出，不能算作推送记录。补看走 `/dnd backlog`，两条路径语义分开。
+- 勿扰只影响设置者本人。管理员开启勿扰不会影响其他用户，该行为有测试覆盖。
+- 老库升级时会自动 `ALTER TABLE` 补齐字段并记录日志，操作幂等，已有用户默认为 `off`。
+- Worker 版（`worker.js`）提供同一套 `/dnd` 与 `/dnd backlog`。它是单用户部署，状态存于 `settings` 表。
 
 ## 安全与隐私
 
-### 用户的 API Key
+### 用户 API Key 的存储
 
-用 **AES-256-GCM** 加密后存库，格式 `v1:<iv>:<认证标签>:<密文>`，每次用独立随机 IV，认证标签可检测篡改。
+Key 经 AES-256-GCM 加密后入库，格式为 `v1:<iv>:<认证标签>:<密文>`，每次使用独立随机 IV，认证标签可检测篡改。
 
 | 场景 | 能否读到明文 |
 | --- | --- |
-| 拿到数据库文件（备份泄漏、卷被读） | ❌ 不能，只有密文 |
-| 同时拿到 `.env` 里的 `APP_MASTER_KEY` | ✅ 能 |
+| 仅拿到数据库文件（备份泄漏、卷被读取） | 否，只有密文 |
+| 同时拿到 `.env` 中的 `APP_MASTER_KEY` | 是 |
 
-> **这里要说实话**：因为 Bot 必须用用户的 Key 去调上游模型，所以用的是**可逆**对称加密，不是散列（散列会让 Key 直接不可用）。因此**作为服务器运维者，你技术上能解密用户存的 Key** —— 这是「服务端代调用」架构决定的，不是实现缺陷。`/ai status` 和管理员 `/admin info` 都只显示打码串（`sk-otb…nCDV`），没有任何「查看明文」的入口，日志也做了脱敏。
->
-> 建议在给用户说明时讲清这一点，并建议他们用**可随时吊销、设了限额**的 Key。另外**别把 `.env` 和数据库打包进同一个备份**——两者分离，数据库才真正安全。
+由于 Bot 需要用用户的 Key 调用上游模型，加密必须是可逆的对称加密而非散列，散列会使 Key 不可用。因此作为服务器运维者，技术上可以解密用户存储的 Key。这由「服务端代调用」的架构决定，不是实现缺陷。`/ai status` 与管理员 `/admin info` 均只显示打码串（形如 `sk-otb…nCDV`），没有查看明文的入口，日志也做了脱敏。
 
-**`APP_MASTER_KEY` 一旦设定不可更改**：改了之后所有用户已存的 Key 全部解不开（服务会跳过该用户并记一条 `API Key 无法解密`，不会崩）。
+建议向用户说明这一点，并建议他们使用可随时吊销、设有额度限制的 Key。另外，不要把 `.env` 与数据库打包进同一个备份，两者分离时数据库才真正安全。
 
-### 三层防护
+`APP_MASTER_KEY` 一经设定即不可更改。修改后所有用户已存的 Key 都无法解密，服务会跳过该用户并记录一条 `API Key 无法解密`，不会崩溃。
 
-**ReDoS 防护** —— 关键词正则是用户可控输入，`(a+)+$` 能把事件循环钉死。三层拦截：
+### 防护措施
 
-1. 长度上限（`MAX_REGEX_LEN`，默认 500）
+**ReDoS 防护。** 关键词正则是用户可控输入，`(a+)+$` 这类模式可以钉死事件循环。防护分三层：
+
+1. 长度上限，`MAX_REGEX_LEN` 默认 500
 2. 静态分析拒绝嵌套量词、反向引用等回溯炸弹结构
-3. 实际匹配跑在 worker 线程并带硬超时，超时即终止并重建该 worker，主进程不受影响
+3. 实际匹配运行在 worker 线程并带硬超时，超时即终止并重建该 worker，主进程不受影响
 
-**SSRF 防护** —— `/ai set` 的 `base_url` 做词法校验，拒绝本机/内网/链路本地/CGNAT（含云元数据 `100.100.100.200`）/IPv6 本地等字面量地址。
+**SSRF 防护。** `/ai set` 的 `base_url` 做词法校验，拒绝本机、内网、链路本地、CGNAT（含云元数据 `100.100.100.200`）与 IPv6 本地等字面量地址。
 
-> **残余风险**（写明白）：词法校验挡不住「攻击者控制的域名解析到内网」。单用户自用可接受；**公开多用户部署建议额外做容器出口限制**（只允许必要公网），或改成解析 DNS 后校验目标 IP。后者当前未实现。
+词法校验挡不住「攻击者控制的域名解析到内网」。单用户自用可以接受；公开多用户部署建议额外限制容器出口，只放行必要的公网地址，或改为解析 DNS 后校验目标 IP。后者当前未实现。
 
-**容器加固** —— compose 默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件系统（仅 `/data` 与 `/tmp` 可写）、非 root（uid 1000）运行、tini 作 PID 1 保证 `SIGTERM` 优雅退出。
+**容器加固。** compose 默认启用 `no-new-privileges`、`cap_drop: ALL`、只读根文件系统（仅 `/data` 与 `/tmp` 可写）、以非 root（uid 1000）运行，并用 tini 作为 PID 1 保证 `SIGTERM` 优雅退出。
 
-**日志脱敏** —— `logger.js` 对输出做模式匹配打码（`sk-`、`Bearer`、URL 里的 token 等）。
+**日志脱敏。** `logger.js` 对输出做模式匹配打码，覆盖 `sk-` 前缀、`Bearer` 令牌、URL 中的 token 等。
 
 ### 防滥用默认值
 
 | 层面 | 机制 | 默认值 |
 | --- | --- | --- |
 | 命令频率 | 每用户令牌桶 | 20 条/分钟 |
-| 注册 | 冷却 + 总人数上限 | 30 秒 / 200 人 |
-| 推送量 | 每用户每日推送配额 | 500 条 |
+| 注册 | 冷却与人数上限 | 30 秒，200 人 |
+| 推送量 | 每用户每日配额 | 500 条 |
 | 关键词数量 | 每用户上限 | 20 条 |
-| 单轮规模 | 单用户单轮推送上限 | 10 条（超出合并为汇总消息） |
+| 单轮规模 | 单用户单轮推送上限 | 10 条，超出合并为汇总消息 |
 | 全局限流 | Telegram 发送速率 | 20 条/秒 |
-| AI 调用 | 每用户每日配额 | 不限（`0` = 不限） |
+| AI 调用 | 每用户每日配额 | 不限，`0` 表示不限 |
 
-**管理员不受任何配额限制**（单用户模式下只有管理员一人，设限没意义）。可用 `/admin quota <id> ai 500` 给可信用户放宽。
-
----
+管理员不受任何配额限制，单用户模式下只有管理员一人，设限没有意义。可用 `/admin quota <id> ai 500` 为可信用户放宽。
 
 ## 环境变量
 
-完整列表与逐项说明见 [`server/.env.example`](server/.env.example)（写得很细，建议直接读）。
+完整列表与逐项说明见 [`server/.env.example`](server/.env.example)。
 
 ### 必填
 
 | 名称 | 说明 |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Bot Token，从 [@BotFather](https://t.me/BotFather) 获取 |
-| `APP_MASTER_KEY` | 加密用户 API Key 的主密钥，`openssl rand -hex 32` 生成，**不可事后更改** |
+| `APP_MASTER_KEY` | 加密用户 API Key 的主密钥，`openssl rand -hex 32` 生成，不可事后更改 |
 
 ### 常用
 
 | 名称 | 默认 | 说明 |
 | --- | --- | --- |
-| `MULTI_USER_ENABLED` | `false` | `false` = 单用户；`true` = 允许多人自助 `/bind`。管理员可用 `/admin multiuser` 运行时覆盖 |
-| `ADMIN_TELEGRAM_IDS` | 空 | 预指定管理员，逗号分隔。留空时第一个 `/bind` 的人成为管理员。填了可防止被陌生人认领，也可用于**找回管理权** |
-| `REGISTRATION_OPEN` | `true` | 多用户下是否开放自助注册；关闭后仅管理员能开通 |
-| `MAX_USERS` | `200` | 用户总数上限（仅多用户） |
+| `MULTI_USER_ENABLED` | `false` | `false` 为单用户，`true` 允许多人自助 `/bind`。管理员可用 `/admin multiuser` 运行时覆盖 |
+| `ADMIN_TELEGRAM_IDS` | 空 | 预指定管理员，逗号分隔。留空时第一个 `/bind` 的人成为管理员。填写可防止被陌生人认领，也可用于找回管理权 |
+| `REGISTRATION_OPEN` | `true` | 多用户模式下是否开放自助注册，关闭后仅管理员能开通 |
+| `MAX_USERS` | `200` | 用户总数上限，仅多用户模式生效 |
 | `DEFAULT_MAX_KEYWORDS` | `20` | 新用户关键词上限 |
 | `DEFAULT_DAILY_PUSH_QUOTA` | `500` | 新用户每日推送上限 |
-| `DEFAULT_DAILY_AI_QUOTA` | `0` | 新用户每日 AI 上限（**`0` = 不限**） |
+| `DEFAULT_DAILY_AI_QUOTA` | `0` | 新用户每日 AI 上限，`0` 表示不限 |
 | `COMMAND_RATE_PER_MIN` | `20` | 每用户每分钟命令数 |
 | `POLL_INTERVAL_MS` | `60000` | 轮询间隔，最小 10000 |
-| `SEND_RATE_PER_SEC` | `20` | 全局发送速率（Bot API 上限约 30） |
+| `SEND_RATE_PER_SEC` | `20` | 全局发送速率，Bot API 上限约为 30 |
 | `AI_CONCURRENCY` | `8` | 同时在飞的 AI 请求数 |
-| `ALLOW_GROUP_CHATS` | `false` | 是否允许群聊使用 |
+| `ALLOW_GROUP_CHATS` | `false` | 是否允许在群聊中使用 |
 | `DND_TIMEZONE` | `Asia/Shanghai` | 勿扰模式定时段的默认时区，用户可用 `/dnd tz` 覆盖 |
-| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `LOG_LEVEL` | `info` | `debug`、`info`、`warn`、`error` |
 
-### 需要留意的两个
+### 需要留意的两项
 
 | 名称 | 默认 | 说明 |
 | --- | --- | --- |
-| `WORKER_POOL_SIZE` | 自动 | **建议不设**。留空时取 `max(2, min(4, os.availableParallelism()))`——后者会读 cgroup 限额。设 `0` 可禁用 worker（退化为进程内计算，**会失去 ReDoS 硬超时保护**） |
-| `WORKER_TASK_TIMEOUT_MS` | `5000` | 单任务超时，超时即判恶意正则并终止 worker。**弱机器上正常任务也可能超时**：实测 1 CPU 容器里「4 万关键词 × 30 帖」要 24.6 秒，会被误杀 |
-
----
+| `WORKER_POOL_SIZE` | 自动 | 建议不设。留空时取 `max(2, min(4, os.availableParallelism()))`，后者读取 cgroup 限额。设为 `0` 可禁用 worker，退化为进程内计算，但会失去 ReDoS 硬超时保护 |
+| `WORKER_TASK_TIMEOUT_MS` | `5000` | 单任务超时，超时即判定为恶意正则并终止 worker。弱机器上正常任务也可能超时：实测 1 CPU 容器中「4 万关键词 × 30 帖」需 24.6 秒，会被误杀 |
 
 ## 性能与容量
 
 ### CPU 与并发
 
-**默认给容器 1 核**（`docker-compose.yml` 里的 `deploy.resources.limits.cpus: "1.0"`）。
+容器默认分配 1 核，对应 `docker-compose.yml` 中的 `deploy.resources.limits.cpus: "1.0"`。
 
-这个服务是 **I/O 密集**的：大部分时间在等 RSS、等 Telegram、等 AI 上游，CPU 只在解析 XML 和跑关键词正则时短暂忙一下。所以 1 核足够常规规模使用，也不会跟同机的其它服务抢资源——默认值取保守，需要的人自己调大。
+本服务以 I/O 为主，大部分时间在等待 RSS、Telegram 与 AI 上游，CPU 只在解析 XML 和运行关键词正则时短暂繁忙。1 核足以应对常规规模，也不会与同机其他服务争抢资源。默认值取保守，需要时由使用者调大。
 
-worker 线程池会**自动**跟着配额走（用 `os.availableParallelism()` 读 cgroup 限额）：
+worker 线程池自动跟随配额，通过 `os.availableParallelism()` 读取 cgroup 限额：
 
 | `cpus` | 容器可用 CPU | 自动线程数 | 匹配阶段（2000 用户 × 20 词） |
 | --- | --- | --- | --- |
@@ -493,16 +458,16 @@ worker 线程池会**自动**跟着配额走（用 `os.availableParallelism()` �
 | `"3.0"` | 3 | 3 | — |
 | `"4.0"` | 4 | 4 | — |
 
-从 1 核放到 2 核，匹配阶段快约 2 倍（正好等于配额翻倍）。**用户数到千级、或关键词是大列表正则时，建议给到 2~4 核。**
+从 1 核提升到 2 核，匹配阶段约快一倍，与配额增幅一致。用户数达到千级、或关键词为大列表正则时，建议分配 2 到 4 核。
 
-改法：编辑 `docker-compose.yml` 里的 `cpus`，然后 `docker compose up -d` 重建容器。
+修改方式为编辑 `docker-compose.yml` 中的 `cpus`，然后执行 `docker compose up -d` 重建容器。
 
-> **注意两个坑：**
->
-> 1. `cpus` 是 cgroup 配额，**不会**让 `os.cpus()` 变小——它照样报宿主机核数。所以线程数绝不能按 `os.cpus()` 取，否则会在 1 核配额里开 4 个线程互相抢（实测同一负载 452 ms → 3180 ms）。代码里已经用 `availableParallelism()` 修正，**不要手动设 `WORKER_POOL_SIZE` 覆盖它**。
-> 2. 给满（如 `"4.0"`）时，突发流量下本服务可以和同机其它容器争满 4 核。共享机器上请留余量。
+两点需要留意：
 
-如果你的宿主核数较多、又不想改 git 里的默认值，用 override 文件即可（不会和上游改动冲突）：
+1. `cpus` 是 cgroup 配额，不会使 `os.cpus()` 返回的核数变小，它仍报宿主机核数。线程数不能按 `os.cpus()` 取值，否则会在 1 核配额里开启 4 个线程互相争抢（同一负载实测从 452 ms 恶化到 3180 ms）。代码已改用 `availableParallelism()`，不要手动设置 `WORKER_POOL_SIZE` 覆盖它。
+2. 配额给满（如 `"4.0"`）时，突发流量下本服务可与同机其他容器争用全部核心。共享机器上应留出余量。
+
+宿主机核数较多、又不希望修改 git 中的默认值时，可使用 override 文件，避免与上游改动冲突：
 
 ```yaml
 # docker-compose.override.yml，与 docker-compose.yml 同目录
@@ -514,7 +479,7 @@ services:
           cpus: "4.0"
 ```
 
-### 一轮只抓一次 RSS
+### 一轮只抓取一次 RSS
 
 ```
 抓取（1 次，与用户数无关）
@@ -524,46 +489,44 @@ services:
                     └─► 发送（受全局限速）
 ```
 
-100 个用户和 1 个用户在**网络抓取**上的开销完全相同，只有内存匹配量随用户数线性增长。
+100 个用户与 1 个用户在网络抓取上的开销完全相同，只有内存匹配量随用户数线性增长。
 
 ### 各环节的实际上限
 
 | 环节 | 上限 | 折算 |
 | --- | --- | --- |
-| **Telegram 发送** | ~1180 条/轮（20 条/秒 × 60 秒） | 平均每人每轮命中 < 0.59 帖；调到 30 条/秒则 ~1775 |
-| **AI 摘要** | 不再是瓶颈（同帖场景 200 人 104ms） | 内容各异的极限约 `AI_CONCURRENCY × 轮询间隔 / 单次延迟` |
-| **关键词匹配** | 够用，约占一轮 1% | 到 1 万用户仍有余量 |
-| **数据库** | 水位线恒定 2000 行 / 0.3 MiB | 不随用户数或时间增长 |
+| Telegram 发送 | 约 1180 条/轮（20 条/秒 × 60 秒） | 平均每人每轮命中需低于 0.59 帖；调到 30 条/秒则约 1775 |
+| AI 摘要 | 不再是瓶颈（同帖场景 200 人 104 ms） | 内容各异的极限约为 `AI_CONCURRENCY × 轮询间隔 / 单次延迟` |
+| 关键词匹配 | 约占一轮的 1% | 到 1 万用户仍有余量 |
+| 数据库 | 水位线恒定 2000 行 / 0.3 MiB | 不随用户数或时间增长 |
 
-**发送速率才是第一瓶颈。** 2000 个用户一轮全都有命中时需要约 100 秒 > 60 秒间隔，表现是**跳过后续轮次并丢通知**（RSS 只给最新约 20 条，掉出窗口的帖子不会再推）。真到那个量级要动这两个参数：
+发送速率是第一瓶颈。2000 个用户在同一轮全部命中时需要约 100 秒，超过 60 秒的轮询间隔，表现为跳过后续轮次并丢失通知（RSS 只提供最新约 20 条，掉出窗口的帖子不会再推）。达到该量级需调整两个参数：
 
 ```bash
-POLL_INTERVAL_MS=90000     # 把突发摊开
+POLL_INTERVAL_MS=90000     # 摊开突发
 SEND_RATE_PER_SEC=30       # Telegram 文档上限
 ```
 
-### 已见记录：一个关键的实现选择
+### 已见记录的实现选择
 
-**不是「每用户 × 每帖一行」，而是每个「用户 × 源」只存一行「见过的最大 post_id」**（`seen_state` 表）。帖子号随发帖时间严格递增，所以「id ≤ 水位线」等价于「已见过」。
+已见记录不是「每用户 × 每帖一行」，而是每个「用户 × 源」只存一行「见过的最大 post_id」（`seen_state` 表）。帖子号随发帖时间严格递增，因此「id 小于等于水位线」等价于「已见过」。
 
-旧实现的问题：实测 NodeSeek 约 2.8 帖/分钟，2000 用户 7 天会涨到 **约 6000 万行 / 6 GiB**，而 RSS 只暴露最新约 20 条——绝大多数行永远查不到。每小时清理还是一次全表扫描（490 万行实测 6.9 秒，且跑在主线程上，期间 bot 不响应命令）。
+旧实现存在容量问题：实测 NodeSeek 约 2.8 帖/分钟，2000 用户 7 天会增长到约 6000 万行、6 GiB，而 RSS 只暴露最新约 20 条，绝大多数行永远不会被查询。每小时清理仍是一次全表扫描（490 万行实测 6.9 秒），且运行在主线程上，期间 bot 不响应命令。
 
-改水位线后：**2000 行 / 0.3 MiB 恒定**，`filterUnseen` 2000 用户 13 ms、`markSeen` 58 ms，且不再需要按时间清理。
+改为水位线后，数据量恒定为 2000 行、0.3 MiB，`filterUnseen` 处理 2000 用户耗时 13 ms，`markSeen` 耗时 58 ms，且不再需要按时间清理。
 
-> **升级垫片**：老库有 `seen_posts` 但无水位线时，会按需用旧表里该用户的最大 `post_id` 初始化水位线（走主键索引，单次 O(log n)）。少了这一步，升级后第一轮会把整个 feed 当全新帖，给每个老用户推最多 10 条。
->
-> 旧表不再被读取，但历史数据仍占磁盘，服务会在每小时维护里**分批**清空（约 8 万行/秒，受 `LEGACY_SEEN_PURGE_MS` 预算约束）。6000 万行约需 20 天排完；想立刻拿回空间就重建数据卷。
+老库只有 `seen_posts` 而缺少水位线时，会按需用旧表中该用户的最大 `post_id` 初始化水位线，走主键索引，单次 O(log n)。缺少这一步时，升级后第一轮会把整个 feed 当作全新帖子，为每个老用户推送最多 10 条。
 
----
+旧表不再被读取，但历史数据仍占磁盘空间，服务会在每小时维护中分批清空（约 8 万行/秒，受 `LEGACY_SEEN_PURGE_MS` 预算约束）。6000 万行约需 20 天清理完毕；需要立即释放空间则重建数据卷。
 
 ## 运维
 
 ### 数据与备份
 
-数据库在容器内 `/data/nodeseek.db`（含 WAL/SHM），默认放在命名卷 `nodeseek-data`。
+数据库位于容器内 `/data/nodeseek.db`，含 WAL 与 SHM 文件，默认放在命名卷 `nodeseek-data`。
 
 ```bash
-# 备份（含 .env！没有 APP_MASTER_KEY，Key 就是一堆解不开的密文）
+# 备份。需包含 .env，否则没有 APP_MASTER_KEY 时 Key 是无法解开的密文
 docker compose stop
 docker run --rm -v nodeseek-data:/data -v "$PWD:/backup" alpine \
   tar czf /backup/nodeseek-backup-$(date +%F).tar.gz -C /data .
@@ -581,9 +544,9 @@ docker compose up -d
 
 ### 改用宿主机目录
 
-把 compose 里的 `- nodeseek-data:/data` 换成 `- ./data:/data`（并删掉末尾 `volumes:` 段）。
+将 compose 中的 `- nodeseek-data:/data` 改为 `- ./data:/data`，并删除末尾的 `volumes:` 段。
 
-**必须先建目录并交给 uid 1000**，否则会因属主是 root 而反复崩溃：
+必须预先创建目录并将属主改为 uid 1000，否则会因属主为 root 而反复崩溃：
 
 ```
 Error: unable to open database file (ERR_SQLITE_ERROR, errcode 14)
@@ -593,7 +556,7 @@ Error: unable to open database file (ERR_SQLITE_ERROR, errcode 14)
 mkdir -p data && sudo chown -R 1000:1000 data
 ```
 
-之后数据在 `./data/nodeseek.db`，备份 `tar czf nodeseek-backup-$(date +%F).tar.gz data/ .env` 即可。
+之后数据位于 `./data/nodeseek.db`，备份命令为 `tar czf nodeseek-backup-$(date +%F).tar.gz data/ .env`。
 
 ### 升级
 
@@ -601,41 +564,41 @@ mkdir -p data && sudo chown -R 1000:1000 data
 docker compose pull && docker compose up -d
 ```
 
-schema 用 `CREATE TABLE IF NOT EXISTS` 幂等创建，直接升级即可，无需手动迁移。
+schema 通过 `CREATE TABLE IF NOT EXISTS` 幂等创建，可直接升级，无需手动迁移。
 
-> **改了 compose 或 `.env` 之后**：`docker compose up -d` 会通过配置哈希检测到变化并**自动重建**容器（实测改 `cpus`、改 `env_file` 都会触发 `Recreated`）。所以通常不需要手动 `--force-recreate`。
->
-> 如果改了配置却看到 `Container ... Running`（没有 `Recreated`），说明 compose 认为没变化——此时才需要 `--force-recreate`。改完建议直接核对容器实际值，比看文件可靠：
->
-> ```bash
-> docker inspect nodeseek-monitor --format 'NanoCpus={{.HostConfig.NanoCpus}}'   # 1e9 = 1 核
-> docker exec nodeseek-monitor sh -c 'cat /sys/fs/cgroup/cpu.max'                # 100000 100000 = 1 核
-> ```
+修改 compose 或 `.env` 后，`docker compose up -d` 会通过配置哈希检测变化并自动重建容器。实测修改 `cpus` 或 `env_file` 都会触发 `Recreated`，通常不需要手动 `--force-recreate`。
+
+若修改配置后看到 `Container ... Running` 而没有 `Recreated`，说明 compose 认为配置未变化，此时才需要 `--force-recreate`。修改后建议直接核对容器的实际值：
+
+```bash
+docker inspect nodeseek-monitor --format 'NanoCpus={{.HostConfig.NanoCpus}}'   # 1e9 为 1 核
+docker exec nodeseek-monitor sh -c 'cat /sys/fs/cgroup/cpu.max'                # 100000 100000 为 1 核
+```
 
 ### 健康检查
 
 ```bash
-docker compose ps                                          # 看 healthy
+docker compose ps                                          # 查看 healthy
 docker compose exec nodeseek-monitor curl -s localhost:8787/healthz | head
 ```
 
-返回 JSON 含最近一轮耗时、推送数、worker 池状态、限流表大小等。
+返回的 JSON 包含最近一轮耗时、推送数、worker 池状态与限流表大小。
 
 ### 排障
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| 日志 `409 Conflict` | 同一 Bot Token 在别处长轮询。停掉另一处（含旧的 Worker Webhook） |
-| 收不到推送 | `/status` 看配额；`/list` 确认关键词已加且未暂停；新用户第一轮可能有延迟 |
-| 没有 AI 摘要 | `/ai status` 看配置；`/ai test` 看上游报错；日志搜 `[ai]`；确认该帖有正文 |
-| 日志 `API Key 无法解密` | `APP_MASTER_KEY` 被改过。让该用户重新 `/ai set` |
-| 容器反复重启 + `unable to open database file` | 用了绑定挂载但目录属主是 root。`sudo chown -R 1000:1000 data`，或改回命名卷 |
-| `401 Unauthorized` / `denied`（拉镜像） | GHCR 包不是公开的。见上文[用预构建镜像](#用预构建镜像还是自己构建) |
-| `Conflict. The container name ... is already in use` | 本机已有一份在跑。同一台机器只能跑一份，或改 `container_name` 与卷名 |
-| 别人 `/bind` 提示「单用户模式」 | 默认行为。`/admin multiuser on` 或 `.env` 设 `MULTI_USER_ENABLED=true` |
-| 自己不是管理员了 | 被别的账号抢先认领了。`.env` 填 `ADMIN_TELEGRAM_IDS=你的ID` 后重启即可拿回 |
-| 富文本推送变成旧版式 | `sendRichMessage` 失败会降级成经典 HTML。日志搜 `降级为经典格式`；网络抖动会自动重试 2 次 |
-| 内存持续增长 | 检查 `WORKER_POOL_SIZE` 与 `AI_CONCURRENCY`；worker 超时会重建，正常不泄漏 |
+| 日志出现 `409 Conflict` | 同一 Bot Token 在别处长轮询。停掉另一处，包括旧的 Worker Webhook |
+| 收不到推送 | 用 `/status` 查看配额，用 `/list` 确认关键词已添加且未暂停。新用户第一轮可能有延迟 |
+| 没有 AI 摘要 | 用 `/ai status` 查看配置，`/ai test` 查看上游报错，日志搜索 `[ai]`，并确认该帖有正文 |
+| 日志出现 `API Key 无法解密` | `APP_MASTER_KEY` 被修改过。需让该用户重新执行 `/ai set` |
+| 容器反复重启并报 `unable to open database file` | 使用绑定挂载但目录属主为 root。执行 `sudo chown -R 1000:1000 data`，或改回命名卷 |
+| 拉镜像报 `401 Unauthorized` 或 `denied` | GHCR 包不是公开的，见[预构建镜像与源码构建](#预构建镜像与源码构建) |
+| 报 `Conflict. The container name ... is already in use` | 本机已有一份在运行。同一台机器只能运行一份，或修改 `container_name` 与卷名 |
+| 他人 `/bind` 提示单用户模式 | 这是默认行为。执行 `/admin multiuser on`，或在 `.env` 中设置 `MULTI_USER_ENABLED=true` |
+| 自己不再是管理员 | 被其他账号抢先认领。在 `.env` 中填写 `ADMIN_TELEGRAM_IDS=你的ID` 后重启 |
+| 富文本推送变成旧版式 | `sendRichMessage` 失败后降级为经典 HTML。日志搜索 `降级为经典格式`，网络抖动会自动重试 2 次 |
+| 内存持续增长 | 检查 `WORKER_POOL_SIZE` 与 `AI_CONCURRENCY`。worker 超时后会重建，正常情况下不泄漏 |
 
 ### 不用 Compose
 
@@ -651,7 +614,7 @@ docker run -d --name nodeseek-monitor \
   ghcr.io/seameee/nodeseek-monitor:latest
 ```
 
-不用 Docker 直接跑（需要 Node.js **22.13+**，用到内置 `node:sqlite`，**无需 `npm install`**）：
+不使用 Docker 直接运行需要 Node.js 22.13 及以上（依赖内置 `node:sqlite`），无需执行 `npm install`：
 
 ```bash
 cd server
@@ -662,25 +625,50 @@ DB_PATH=./data/nodeseek.db \
 node src/index.js
 ```
 
----
+## Node 版本与安全更新
+
+基础镜像钉定到具体补丁版本：`node:24.22.1-alpine`。
+
+2026-10-21 的 Node.js 安全公告（[原文](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)）修复了 4 个 HIGH 级问题，修复版本为 24.22.1：
+
+| CVE | 问题 |
+| --- | --- |
+| CVE-2026-111497 | Brotli 解码器越界写，可导致远程代码执行 |
+| CVE-2026-105482 | `dns.resolve` 截断含 NUL 字符的名称 |
+| CVE-2026-105483 | IP 写成全角数字时绕过 TLS 主机名校验 |
+| CVE-2026-106069 | 主机名宽松解析为 IP 时绕过 TLS 证书校验 |
+
+不使用浮动的 `24-alpine` 标签，原因是浮动标签虽然通常能跟随上游更新，但构建结果不可复现。基础镜像缓存或镜像源滞后时会静默回退到带漏洞的版本，而 CI 仍然通过，无法从结果中察觉。钉定补丁号后，升级成为一次显式的、可审计的变更。
+
+升级方式为修改 `Dockerfile` 中的 `ARG NODE_VERSION`，先确认标签存在：
+
+```bash
+docker run --rm node:24.22.1-alpine node --version   # 应输出 v24.22.1
+```
+
+确认容器内的实际版本：
+
+```bash
+docker exec nodeseek-monitor node --version
+```
 
 ## 仓库结构
 
 ```
 ├── server/                    ← Docker 版全部内容
-│   ├── src/                   ← 19 个模块，零第三方依赖（全用 Node 内置）
-│   ├── test/                  ← 16 个测试文件，124 项
+│   ├── src/                   ← 20 个模块，零第三方依赖，全部使用 Node 内置能力
+│   ├── test/                  ← 19 个测试文件，185 项
 │   ├── Dockerfile             ← 多阶段构建，node:24.22.1-alpine，非 root
 │   ├── docker-compose.yml     ← 含安全加固与资源限制
-│   └── .env.example           ← 环境变量模板（写得很细）
+│   └── .env.example           ← 环境变量模板
 ├── .github/workflows/docker.yml  ← 多架构构建并推送 GHCR
-├── worker.js                  ← Workers 版（main 分支的内容，本分支保留但不使用）
+├── worker.js                  ← Workers 版，main 分支的内容，本分支保留但不使用
 ├── proxy-server*.js           ← 可选的反向代理辅助工具
 ├── LICENSE                    ← MIT，仅覆盖本仓库新增与修改部分
 └── NOTICE                     ← 上游来源与授权范围划分
 ```
 
-跑测试：
+运行测试：
 
 ```bash
 cd server && node --check src/*.js && node --test test/*.test.js
@@ -690,18 +678,16 @@ cd server && node --check src/*.js && node --test test/*.test.js
 
 | 表 | 用途 |
 | --- | --- |
-| `users` | 用户、角色、状态、配额覆盖 |
+| `users` | 用户、角色、状态、配额覆盖、勿扰设置 |
 | `keywords` | 监控关键词 |
-| `ai_configs` | AI 配置（`api_key_enc` 为密文） |
-| `seen_state` | 已见水位线（每用户每源一行） |
-| `notifications` | 推送历史，供 `/history`（保留 30 天） |
-| `usage_daily` | 日用量计数（保留 90 天） |
-| `audit_log` | 管理操作审计（保留 30 天） |
-| `rss_state` | 各源 ETag / 失败计数 |
-| `settings` | 运行状态（模式覆盖、关键词修订号等） |
-| `seen_posts` | **已废弃**，旧版遗留，仅分批清空 |
-
----
+| `ai_configs` | AI 配置，`api_key_enc` 为密文 |
+| `seen_state` | 已见水位线，每用户每源一行 |
+| `notifications` | 推送历史，供 `/history` 与 `/dnd backlog`，保留 30 天 |
+| `usage_daily` | 日用量计数，保留 90 天 |
+| `audit_log` | 管理操作审计，保留 30 天 |
+| `rss_state` | 各源 ETag 与失败计数 |
+| `settings` | 运行状态，含模式覆盖、关键词修订号等 |
+| `seen_posts` | 已废弃，旧版遗留，仅分批清空 |
 
 ## 来源与致谢
 
@@ -713,25 +699,28 @@ cd server && node --check src/*.js && node --test test/*.test.js
 
 | 类别 | 内容 |
 | --- | --- |
-| 多用户服务端 | 原生 Node.js + SQLite 实现，角色分离、自助注册、配额与封禁 |
+| 多用户服务端 | 原生 Node.js 与 SQLite 实现，角色分离、自助注册、配额与封禁 |
 | 通知排版 | Bot API 10.3 富文本（标题即链接、关键词折叠、引用块承载摘要、cite 标注模型），含经典 HTML 降级与重试 |
 | AI 摘要 | 用户自带 Key、多级模型回退、按内容去重与在飞请求合并 |
-| 性能 | worker 线程池 + ReDoS 硬超时、水位线去重、AI 跨用户拍平、发送令牌桶 |
+| 性能 | worker 线程池与 ReDoS 硬超时、水位线去重、AI 跨用户拍平、发送令牌桶 |
 | 安全 | AES-256-GCM 加密 Key、日志脱敏、SSRF 词法校验、容器加固 |
-| 工程 | 124 项测试、可复跑基准脚本、多架构 CI 构建 |
+| 勿扰模式 | 按用户暂停推送、定时与每日时段、跨零点与时区处理、补看 |
+| 工程 | 185 项测试、可复跑基准脚本、多架构 CI 构建 |
 
 ### 授权状态
 
-**上游仓库未附带任何开源许可证**（根目录只有 `README.md` 与 `worker.js`，均无版权或许可声明）。按著作权法默认规则，未声明即视为保留所有权利。
+上游仓库未附带任何开源许可证，根目录只有 `README.md` 与 `worker.js`，均无版权或许可声明。按著作权法默认规则，未声明即视为保留所有权利。
 
 因此：
 
-- 本仓库**不对上游原始代码主张任何许可**，该部分权利归 [Roddy-D](https://github.com/Roddy-D) 所有
+- 本仓库不对上游原始代码主张任何许可，该部分权利归 [Roddy-D](https://github.com/Roddy-D) 所有
 - 本仓库新增或修改的部分按根目录 `LICENSE`（MIT）授权
 - 两部分的具体划分见 `NOTICE`
 
-如需将上游原始代码用于本项目之外的用途，请自行联系原作者取得授权。
+如需将上游原始代码用于本项目之外的用途，请联系原作者取得授权。
 
 ### 致谢
 
 感谢 [Roddy-D](https://github.com/Roddy-D) 公开的初始实现。本项目的通知排版、AI 摘要与性能优化，都建立在它提供的骨架之上。
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
