@@ -150,6 +150,11 @@ export const config = {
 
   // HTTP 健康检查服务（给 Docker healthcheck 用）
   healthPort: intEnv("HEALTH_PORT", 8787, { min: 0, max: 65_535 }),
+
+  // 勿扰模式的默认时区（用户可用 /dnd tz 覆盖自己的）。
+  // 容器里 datetime 通常是 UTC，而「23:00 到 08:00」指的是用户本地钟点 ——
+  // 用 UTC 比较会让窗口整体平移 8 小时，用户完全无法预期。
+  dndTimezone: String(process.env.DND_TIMEZONE || "Asia/Shanghai").trim() || "Asia/Shanghai",
 };
 
 export const RSS_SOURCES = [

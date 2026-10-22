@@ -132,10 +132,23 @@ export async function sendMessage(chatId, text, opts = {}) {
  * 策略：网络错误与 5xx 走 tg 的指数退避（retries: 2，最多多等约 1.5 秒）；
  * 4xx（正文确实不合法，重试无意义）在 tg 内部直接返回、不重试，于是仍然降级。
  * 即：**内容被拒才降级，网络抖动不降级**。
+ *
+ * opts.silent 用于勿扰模式：Bot API 的 disable_notification 是**按消息**生效的，
+ * 而每个用户收到的都是各自独立的消息，因此「按用户静音」天然成立。官方参数表
+ * 确认 sendRichMessage 也支持该参数（与 sendMessage 一致），
+ * 所以静音不会导致降级成经典版式。
  */
-export async function sendRichMessage(chatId, html) {
+export async function sendRichMessage(chatId, html, opts = {}) {
   return withChatLock(chatId, async () => {
-    const r = await tg("sendRichMessage", { chat_id: chatId, rich_message: { html } }, { retries: 2 });
+    const r = await tg(
+      "sendRichMessage",
+      {
+        chat_id: chatId,
+        rich_message: { html },
+        ...(opts.silent ? { disable_notification: true } : {}),
+      },
+      { retries: 2 }
+    );
     return r.ok === true;
   });
 }

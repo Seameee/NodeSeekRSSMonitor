@@ -55,6 +55,16 @@ export const USER_HELP_SECTIONS = [
     ],
   },
   {
+    title: "勿扰模式（只静音，不丢消息）",
+    items: [
+      ["/dnd 2h", "静音 2 小时，到点自动恢复通知"],
+      ["/dnd 23:00-08:00", "每天这个时段静音（可跨零点）"],
+      ["/dnd on / /dnd off", "一直静音 / 立即恢复"],
+      ["/dnd tz &lt;时区&gt;", "设时区，如 Asia/Shanghai"],
+      ["/dnd", "查看当前状态"],
+    ],
+  },
+  {
     title: "其他",
     items: [
       ["/history [数量]", "最近推送记录"],
@@ -88,6 +98,7 @@ export const BOT_MENU = [
   ["resume", "恢复关键词"],
   ["categories", "可用版块"],
   ["ai", "配置 AI 摘要"],
+  ["dnd", "勿扰模式（静音）"],
   ["status", "我的状态"],
   ["history", "推送记录"],
   ["help", "查看帮助"],

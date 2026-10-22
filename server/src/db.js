@@ -34,7 +34,14 @@ CREATE TABLE IF NOT EXISTS users (
   max_keywords      INTEGER,
   daily_ai_quota    INTEGER,
   daily_push_quota  INTEGER,
-  note              TEXT
+  note              TEXT,
+  -- 勿扰模式（每个用户独立）：off / on / until / window
+  -- 详见 dnd.js。推送照常送达，只是带上 disable_notification 不响铃。
+  dnd_mode          TEXT    NOT NULL DEFAULT 'off',
+  dnd_until         TEXT,
+  dnd_start         TEXT,
+  dnd_end           TEXT,
+  dnd_tz            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS keywords (
@@ -141,6 +148,32 @@ db.exec("PRAGMA busy_timeout = 5000");
 db.exec("PRAGMA temp_store = MEMORY");
 db.exec(SCHEMA);
 
+// ─── 增量迁移 ────────────────────────────────────────────────────────────────
+//
+// CREATE TABLE IF NOT EXISTS 对已存在的表**不会补列**，所以老库升级时新加的
+// 字段必须显式 ALTER 出来。全部写成「缺了才加」，重复执行无副作用。
+
+function addColumnIfMissing(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (cols.some((c) => c.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  return true;
+}
+
+function migrateSchema() {
+  // 勿扰模式（2026-10 新增）
+  const added = [
+    addColumnIfMissing("users", "dnd_mode", "TEXT NOT NULL DEFAULT 'off'"),
+    addColumnIfMissing("users", "dnd_until", "TEXT"),
+    addColumnIfMissing("users", "dnd_start", "TEXT"),
+    addColumnIfMissing("users", "dnd_end", "TEXT"),
+    addColumnIfMissing("users", "dnd_tz", "TEXT"),
+  ].filter(Boolean);
+  if (added.length) log.info("db", `已为老库补齐勿扰模式字段：${added.length} 列`);
+}
+
+migrateSchema();
+
 // ─── 预编译语句缓存 ──────────────────────────────────────────────────────────
 
 const stmtCache = new Map();
@@ -230,6 +263,49 @@ export function touchUser(telegramId, username, displayName) {
 
 export function setUserStatus(telegramId, status) {
   return prep("UPDATE users SET status=? WHERE telegram_id=?").run(status, telegramId).changes;
+}
+
+// ─── 勿扰模式 ────────────────────────────────────────────────────────────────
+//
+// 每次都是**整行覆盖**这五个字段，而不是零散更新：模式之间互斥（until 的
+// dnd_until、window 的 dnd_start/end 不该互相残留），整行写能把状态收敛成
+// 唯一一种解释，不会出现「改了模式但旧字段还在、判定逻辑按旧字段走」的歧义。
+
+/** 关闭勿扰 */
+export function clearDnd(telegramId) {
+  return prep(
+    `UPDATE users SET dnd_mode='off', dnd_until=NULL, dnd_start=NULL, dnd_end=NULL
+     WHERE telegram_id=?`
+  ).run(telegramId).changes;
+}
+
+/** 一直静音，直到显式关闭 */
+export function setDndAlways(telegramId) {
+  return prep(
+    `UPDATE users SET dnd_mode='on', dnd_until=NULL, dnd_start=NULL, dnd_end=NULL
+     WHERE telegram_id=?`
+  ).run(telegramId).changes;
+}
+
+/** 静音到某个时间点（ISO 字符串） */
+export function setDndUntil(telegramId, untilIso) {
+  return prep(
+    `UPDATE users SET dnd_mode='until', dnd_until=?, dnd_start=NULL, dnd_end=NULL
+     WHERE telegram_id=?`
+  ).run(untilIso, telegramId).changes;
+}
+
+/** 每天固定时段静音（HH:MM 形式，本地时钟） */
+export function setDndWindow(telegramId, start, end) {
+  return prep(
+    `UPDATE users SET dnd_mode='window', dnd_until=NULL, dnd_start=?, dnd_end=?
+     WHERE telegram_id=?`
+  ).run(start, end, telegramId).changes;
+}
+
+/** 设置用户时区（影响 window 模式的判定与文案显示） */
+export function setDndTimezone(telegramId, tz) {
+  return prep("UPDATE users SET dnd_tz=? WHERE telegram_id=?").run(tz, telegramId).changes;
 }
 
 export function setUserQuota(telegramId, field, value) {

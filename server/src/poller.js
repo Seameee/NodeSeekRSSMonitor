@@ -39,6 +39,7 @@ import { fetchEntries } from "./rss.js";
 import { buildRichNotifMsg, buildNotifMsg, buildOverflowMsg } from "./notify.js";
 import { sendMany, sendMessage, sendRichMessage } from "./telegram.js";
 import { shouldNotifyQuota } from "./quota.js";
+import { isDndActive } from "./dnd.js";
 import { log } from "./logger.js";
 
 // 每用户的生效关键词缓存：{ revision, keywords }
@@ -201,6 +202,12 @@ export async function runRound() {
     const plan = { uid, summaries: new Map(), targets: 0 };
     plans.push(plan);
 
+    // 勿扰模式：本轮该用户的推送全部带 disable_notification。
+    // 每个用户各自判断，因此「按个人开关静音」不需要任何全局状态。
+    // 注意**只影响推送**：用户自己发命令收到的回复照常有提示音 —— 那是他刚
+    // 主动操作的动作回执，静音它只会让人以为命令没生效。
+    const silent = isDndActive(user);
+
     // AI 摘要：只对配置了 AI 且还有配额的用户做
     const ai = aiByUser.get(uid);
     if (ai && usable.length) {
@@ -222,12 +229,12 @@ export async function runRound() {
     }
 
     for (const { post, matched } of usable) {
-      pushJobs.push({ uid, post, matched, summary: null });
+      pushJobs.push({ uid, post, matched, summary: null, silent });
       pushOwners.push({ plan, post_id: post.post_id });
     }
 
     if (job.overflow > 0) {
-      pushJobs.push({ uid, overflow: true, items: usable.map((h) => h.post), total: job.overflow });
+      pushJobs.push({ uid, overflow: true, items: usable.map((h) => h.post), total: job.overflow, silent });
       pushOwners.push(null);
     }
   }
@@ -274,16 +281,24 @@ export async function runRound() {
     pushJobs.map((j) => ({
       run: async () => {
         if (j.overflow) {
-          return { ok: true, r: await sendMessage(j.uid, buildOverflowMsg(j.items, j.total)) };
+          return {
+            ok: true,
+            r: await sendMessage(j.uid, buildOverflowMsg(j.items, j.total), {
+              disableNotification: j.silent === true,
+            }),
+          };
         }
         const rich = buildRichNotifMsg(j.post, j.matched, j.summary);
-        const okRich = await sendRichMessage(j.uid, rich);
+        const okRich = await sendRichMessage(j.uid, rich, { silent: j.silent === true });
         if (okRich) return { ok: true, rich: true };
         // 富文本最终失败（网络重试完仍不通，或正文被 Telegram 拒收）→ 降级经典 HTML。
         // 一定要留痕：降级是用户看得见的版式变化，此前只有 tg 层的报错、
         // 定位问题要靠猜（曾误以为是格式写错）。
+        // 降级路径同样要带静音：否则勿扰期间恰好发生降级时，这一条会突然响。
         log.warn("push", `用户 ${j.uid} 富文本发送失败，本条降级为经典格式`);
-        const r = await sendMessage(j.uid, buildNotifMsg(j.post, j.matched, j.summary));
+        const r = await sendMessage(j.uid, buildNotifMsg(j.post, j.matched, j.summary), {
+          disableNotification: j.silent === true,
+        });
         return { ok: r.ok === true, rich: false, r };
       },
     }))

@@ -8,6 +8,7 @@ import { CATEGORIES, config } from "./config.js";
 import {
   addKeyword,
   bumpKeywordRevision,
+  clearDnd,
   countKeywords,
   deleteAiConfig,
   effectiveQuota,
@@ -20,6 +21,10 @@ import {
   getUser,
   listKeywords,
   removeKeywordById,
+  setDndAlways,
+  setDndTimezone,
+  setDndUntil,
+  setDndWindow,
   setKeywordEnabled,
   upsertAiConfig,
 } from "./db.js";
@@ -28,6 +33,15 @@ import { validateKeyword, validateRegex } from "./match.js";
 import { resolveAiConfig, testAiConfig, validateAiNumbers, validateBaseUrl } from "./ai.js";
 import { countAiCall, checkAiQuota } from "./quota.js";
 import { sendMessage } from "./telegram.js";
+import {
+  formatInTz,
+  isDndActive,
+  isValidTimezone,
+  nextChangeMs,
+  parseDuration,
+  parseWindow,
+  tzOf,
+} from "./dnd.js";
 import { buildHelp } from "./notify.js";
 import { log } from "./logger.js";
 
@@ -604,6 +618,149 @@ async function cmdAi(ctx, rest) {
   }
 }
 
+// ─── 勿扰模式 ────────────────────────────────────────────────────────────────
+
+function dndUsageText() {
+  return (
+    "🔕 <b>勿扰模式</b>\n\n" +
+    "开启后推送<b>照常送达</b>，只是<b>不响铃、不振动</b>（Telegram 的静音消息）。" +
+    "关闭后恢复提示音，期间的消息不会漏。\n\n" +
+    "· <code>/dnd 2h</code> — 静音 2 小时，到点自动恢复\n" +
+    "· <code>/dnd 90m</code> — 静音 90 分钟（也支持 <code>1d</code>、<code>1.5h</code>）\n" +
+    "· <code>/dnd 23:00-08:00</code> — 每天这个时段静音，可跨零点\n" +
+    "· <code>/dnd on</code> — 一直静音，直到 <code>/dnd off</code>\n" +
+    "· <code>/dnd off</code> — 立即恢复通知\n" +
+    "· <code>/dnd tz Asia/Shanghai</code> — 设置时区（定时段时用，默认跟随实例）\n" +
+    "· <code>/dnd</code> — 查看当前状态\n\n" +
+    "<i>每个用户独立设置，互不影响；管理员也一样。命令回复不会被静音。</i>"
+  );
+}
+
+/** 把当前勿扰状态渲染成人话 */
+function renderDndState(user, nowMs = Date.now()) {
+  const mode = user?.dnd_mode || "off";
+  const tz = tzOf(user);
+  const active = isDndActive(user, nowMs);
+
+  if (mode === "off") return { active, text: "已关闭，推送正常响铃。" };
+
+  if (mode === "on") {
+    return { active, text: "已开启（长期），直到你发送 <code>/dnd off</code>。" };
+  }
+
+  if (mode === "until") {
+    const until = Date.parse(user?.dnd_until || "");
+    if (!Number.isFinite(until) || until <= nowMs) {
+      return { active, text: "定时静音已到期（即将自动恢复）。" };
+    }
+    return { active, text: `静音至 <b>${formatInTz(until, tz)}</b>（${tz}），到点自动恢复。` };
+  }
+
+  // window
+  const next = nextChangeMs(user, nowMs);
+  const range = `${user?.dnd_start || "?"}–${user?.dnd_end || "?"}`;
+  if (!next) return { active, text: `每日 ${range}（${tz}）静音。` };
+  return {
+    active,
+    text:
+      `每日 <b>${range}</b>（${tz}）静音；` +
+      (active
+        ? `<b>${formatInTz(next, tz)}</b> 恢复通知。`
+        : `<b>${formatInTz(next, tz)}</b> 开始静音。`),
+  };
+}
+
+async function cmdDnd(ctx, rest) {
+  const { user, chatId } = ctx;
+  const id = user.telegram_id;
+  const raw = String(rest || "").trim();
+
+  // 无参数 = 查看状态
+  if (!raw) {
+    const st = renderDndState(user);
+    return reply(
+      chatId,
+      `🔕 <b>勿扰模式</b>：${st.active ? "静音中" : "未静音"}\n` +
+        `<b>状态</b>：${st.text}\n\n` +
+        `<i>推送照常送达，只是不响铃。用 /dnd 2h 这类写法快速开启。</i>`
+    );
+  }
+
+  const [sub, ...args] = raw.split(/\s+/).filter(Boolean);
+  const head = sub.toLowerCase();
+
+  // /dnd off
+  if (["off", "关", "关闭", "停", "stop"].includes(head)) {
+    clearDnd(id);
+    return reply(chatId, `🔔 已关闭勿扰模式，推送恢复正常响铃。`);
+  }
+
+  // /dnd on
+  if (["on", "开", "开启"].includes(head)) {
+    setDndAlways(id);
+    return reply(
+      chatId,
+      `🔕 已开启勿扰模式（长期）。\n推送照常送达，但不响铃。\n\n恢复：<code>/dnd off</code>`
+    );
+  }
+
+  // /dnd status
+  if (["status", "状态", "查询"].includes(head)) {
+    return cmdDnd(ctx, "");
+  }
+
+  // /dnd tz <时区>
+  if (["tz", "timezone", "时区"].includes(head)) {
+    const tz = args[0];
+    if (!tz) {
+      return reply(
+        chatId,
+        `${no} 用法：<code>/dnd tz Asia/Shanghai</code>\n当前：<code>${escapeHtml(tzOf(user))}</code>`
+      );
+    }
+    if (!isValidTimezone(tz)) {
+      return reply(
+        chatId,
+        `${no} 无法识别的时区：<code>${escapeHtml(tz)}</code>\n` +
+          `请用 IANA 名称，例如 <code>Asia/Shanghai</code>、<code>Asia/Tokyo</code>、<code>Europe/London</code>`
+      );
+    }
+    setDndTimezone(id, tz);
+    const fresh = getUser(id);
+    const st = renderDndState(fresh);
+    return reply(chatId, `✅ 时区已设为 <code>${escapeHtml(tz)}</code>\n${st.text}`);
+  }
+
+  // /dnd 23:00-08:00
+  const win = parseWindow(raw);
+  if (win) {
+    setDndWindow(id, win.start, win.end);
+    const fresh = getUser(id);
+    const st = renderDndState(fresh);
+    return reply(
+      chatId,
+      `🔕 已设置每日静音时段\n<b>状态</b>：${st.text}\n\n` +
+        `<i>推送照常送达，只是这段时间不响铃。立即恢复用 /dnd off。</i>`
+    );
+  }
+
+  // /dnd 2h / 90m / 1d
+  const dur = parseDuration(raw);
+  if (dur) {
+    const until = new Date(Date.now() + dur).toISOString();
+    setDndUntil(id, until);
+    const fresh = getUser(id);
+    const st = renderDndState(fresh);
+    return reply(
+      chatId,
+      `🔕 已开启定时静音\n<b>状态</b>：${st.text}\n\n` +
+        `<i>推送照常送达，只是到点前不响铃。提前恢复用 /dnd off。</i>`
+    );
+  }
+
+  return reply(chatId, `${no} 无法识别：<code>${escapeHtml(raw)}</code>\n\n${dndUsageText()}`);
+}
+
 // ─── 状态与历史 ──────────────────────────────────────────────────────────────
 
 async function cmdStatus(ctx) {
@@ -624,6 +781,7 @@ async function cmdStatus(ctx) {
       `<b>关键词</b>：${kwCount}/${formatQuota(q.maxKeywords)} 条\n` +
       `<b>AI 摘要</b>：${ai ? (ai.enabled ? `已启用 · <code>${escapeHtml(ai.model)}</code>` : "已关闭") : "未配置"}\n` +
       `<b>今日用量</b>：推送 ${usage.pushes}/${formatQuota(q.dailyPush)} · AI ${usage.ai_calls}/${formatQuota(q.dailyAi)}\n` +
+      `<b>勿扰模式</b>：${isDndActive(user) ? "🔕 静音中（推送照常送达，不响铃）" : "🔔 未开启"}\n` +
       `<b>注册时间</b>：${user.created_at.slice(0, 19).replace("T", " ")} UTC`
   );
 }
@@ -681,6 +839,10 @@ export async function handleUserCommand(ctx, cmd, rest) {
 
     case "/status":
       await cmdStatus(ctx);
+      return true;
+    case "/dnd":
+    case "/mute":
+      await cmdDnd(ctx, rest);
       return true;
     case "/history":
       await cmdHistory(ctx, rest);
