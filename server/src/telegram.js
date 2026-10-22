@@ -133,10 +133,10 @@ export async function sendMessage(chatId, text, opts = {}) {
  * 4xx（正文确实不合法，重试无意义）在 tg 内部直接返回、不重试，于是仍然降级。
  * 即：**内容被拒才降级，网络抖动不降级**。
  *
- * opts.silent 用于勿扰模式：Bot API 的 disable_notification 是**按消息**生效的，
- * 而每个用户收到的都是各自独立的消息，因此「按用户静音」天然成立。官方参数表
- * 确认 sendRichMessage 也支持该参数（与 sendMessage 一致），
- * 所以静音不会导致降级成经典版式。
+ * opts.silent 是底层的「静音发送」能力（disable_notification）。
+ * 注意它**不等于勿扰**：官方语义是「用户会收到无声的通知」，消息照样进通知栏。
+ * 勿扰模式因此没有用它，改成完全不发 + /dnd backlog 补看（见 poller.js）。
+ * 这个参数保留给「想发但不想响」的场景。
  */
 export async function sendRichMessage(chatId, html, opts = {}) {
   return withChatLock(chatId, async () => {

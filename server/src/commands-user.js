@@ -9,10 +9,14 @@ import {
   addKeyword,
   bumpKeywordRevision,
   clearDnd,
+  markBacklogSeen,
   countKeywords,
+  countMutedHits,
   deleteAiConfig,
+  dndSinceOf,
   effectiveQuota,
   formatQuota,
+  getMutedHits,
   isAdminUser,
   isMultiUserEnabled,
   getAiConfig,
@@ -622,17 +626,18 @@ async function cmdAi(ctx, rest) {
 
 function dndUsageText() {
   return (
-    "🔕 <b>勿扰模式</b>\n\n" +
-    "开启后推送<b>照常送达</b>，只是<b>不响铃、不振动</b>（Telegram 的静音消息）。" +
-    "关闭后恢复提示音，期间的消息不会漏。\n\n" +
-    "· <code>/dnd 2h</code> — 静音 2 小时，到点自动恢复\n" +
-    "· <code>/dnd 90m</code> — 静音 90 分钟（也支持 <code>1d</code>、<code>1.5h</code>）\n" +
-    "· <code>/dnd 23:00-08:00</code> — 每天这个时段静音，可跨零点\n" +
-    "· <code>/dnd on</code> — 一直静音，直到 <code>/dnd off</code>\n" +
-    "· <code>/dnd off</code> — 立即恢复通知\n" +
-    "· <code>/dnd tz Asia/Shanghai</code> — 设置时区（定时段时用，默认跟随实例）\n" +
+    "🔕 <b>勿扰模式（暂停推送）</b>\n\n" +
+    "开启后<b>暂停推送</b>，消息完全不发——没有声音、没有通知栏弹窗、没有未读。\n" +
+    "期间命中的帖子会<b>记录下来</b>，用 <code>/dnd backlog</code> 补看，一条都不会丢。\n\n" +
+    "· <code>/dnd 2h</code> — 暂停 2 小时，到点自动恢复\n" +
+    "· <code>/dnd 90m</code> — 暂停 90 分钟（也支持 <code>1d</code>、<code>1.5h</code>）\n" +
+    "· <code>/dnd 23:00-08:00</code> — 每天这个时段暂停，可跨零点\n" +
+    "· <code>/dnd on</code> — 一直暂停，直到 <code>/dnd off</code>\n" +
+    "· <code>/dnd off</code> — 立即恢复推送\n" +
+    "· <code>/dnd backlog</code> — 补看期间错过的帖子\n" +
+    "· <code>/dnd tz Asia/Shanghai</code> — 设置时区（定时段时用）\n" +
     "· <code>/dnd</code> — 查看当前状态\n\n" +
-    "<i>每个用户独立设置，互不影响；管理员也一样。命令回复不会被静音。</i>"
+    "<i>每个用户独立设置。命令回复不受影响，你自己发命令照常有回执。</i>"
   );
 }
 
@@ -642,7 +647,7 @@ function renderDndState(user, nowMs = Date.now()) {
   const tz = tzOf(user);
   const active = isDndActive(user, nowMs);
 
-  if (mode === "off") return { active, text: "已关闭，推送正常响铃。" };
+  if (mode === "off") return { active, text: "已关闭，推送正常。" };
 
   if (mode === "on") {
     return { active, text: "已开启（长期），直到你发送 <code>/dnd off</code>。" };
@@ -651,22 +656,22 @@ function renderDndState(user, nowMs = Date.now()) {
   if (mode === "until") {
     const until = Date.parse(user?.dnd_until || "");
     if (!Number.isFinite(until) || until <= nowMs) {
-      return { active, text: "定时静音已到期（即将自动恢复）。" };
+      return { active, text: "定时暂停已到期（即将自动恢复）。" };
     }
-    return { active, text: `静音至 <b>${formatInTz(until, tz)}</b>（${tz}），到点自动恢复。` };
+    return { active, text: `暂停至 <b>${formatInTz(until, tz)}</b>（${tz}），到点自动恢复。` };
   }
 
   // window
   const next = nextChangeMs(user, nowMs);
   const range = `${user?.dnd_start || "?"}–${user?.dnd_end || "?"}`;
-  if (!next) return { active, text: `每日 ${range}（${tz}）静音。` };
+  if (!next) return { active, text: `每日 ${range}（${tz}）暂停推送。` };
   return {
     active,
     text:
-      `每日 <b>${range}</b>（${tz}）静音；` +
+      `每日 <b>${range}</b>（${tz}）暂停推送；` +
       (active
-        ? `<b>${formatInTz(next, tz)}</b> 恢复通知。`
-        : `<b>${formatInTz(next, tz)}</b> 开始静音。`),
+        ? `<b>${formatInTz(next, tz)}</b> 恢复推送。`
+        : `<b>${formatInTz(next, tz)}</b> 开始暂停。`),
   };
 }
 
@@ -678,21 +683,55 @@ async function cmdDnd(ctx, rest) {
   // 无参数 = 查看状态
   if (!raw) {
     const st = renderDndState(user);
+    const since = dndSinceOf(user);
+    const missed = countMutedHits(id, since);
+    const backlogLine = missed > 0 ? `\n<b>期间错过</b>：${missed} 条，用 <code>/dnd backlog</code> 补看` : "";
     return reply(
       chatId,
-      `🔕 <b>勿扰模式</b>：${st.active ? "静音中" : "未静音"}\n` +
-        `<b>状态</b>：${st.text}\n\n` +
-        `<i>推送照常送达，只是不响铃。用 /dnd 2h 这类写法快速开启。</i>`
+      `🔕 <b>勿扰模式</b>：${st.active ? "暂停推送中" : "未开启"}\n` +
+        `<b>状态</b>：${st.text}${backlogLine}\n\n` +
+        `<i>开启后推送完全不发，用 /dnd backlog 补看。用 /dnd 2h 这类写法快速开启。</i>`
     );
   }
 
   const [sub, ...args] = raw.split(/\s+/).filter(Boolean);
   const head = sub.toLowerCase();
 
+  // /dnd backlog — 补看期间错过的帖子
+  if (["backlog", "补看", "missed", "错过"].includes(head)) {
+    if (args.some((a) => ["--clear", "clear", "清空"].includes(a.toLowerCase()))) {
+      markBacklogSeen(id);
+      return reply(chatId, `✅ 已清空补看记录，之后只显示新的错过帖子。`);
+    }
+    const since = dndSinceOf(user);
+    const rows = getMutedHits(id, since, config.maxHistoryRows);
+    if (!rows.length) {
+      return reply(
+        chatId,
+        `📭 勿扰期间没有错过任何帖子。\n\n` +
+          `<i>补看范围从 ${escapeHtml(formatInTz(Date.parse(since), tzOf(user)))} 起。</i>`
+      );
+    }
+    const lines = rows.map((r) => {
+      const t = formatInTz(Date.parse(r.sent_at), tzOf(user));
+      return `· <a href="${escapeHtml(r.link)}">${escapeHtml(r.title.slice(0, 60))}</a>\n  <i>${t} · ${escapeHtml(r.keywords || "")}</i>`;
+    });
+    const total = countMutedHits(id, since);
+    const more = total > rows.length ? `\n\n<i>共 ${total} 条，这里显示最近 ${rows.length} 条。</i>` : "";
+    return reply(
+      chatId,
+      `📬 <b>勿扰期间错过 ${total} 条</b>\n\n${lines.join("\n")}${more}\n\n` +
+        `<i>看完可发 <code>/dnd backlog --clear</code> 清空记录。</i>`
+    );
+  }
+
   // /dnd off
   if (["off", "关", "关闭", "停", "stop"].includes(head)) {
     clearDnd(id);
-    return reply(chatId, `🔔 已关闭勿扰模式，推送恢复正常响铃。`);
+    const since = dndSinceOf(user);
+    const missed = countMutedHits(id, since);
+    const tail = missed > 0 ? `\n\n期间错过 ${missed} 条，可用 <code>/dnd backlog</code> 补看。` : "";
+    return reply(chatId, `🔔 已关闭勿扰模式，推送恢复正常。${tail}`);
   }
 
   // /dnd on
@@ -700,7 +739,8 @@ async function cmdDnd(ctx, rest) {
     setDndAlways(id);
     return reply(
       chatId,
-      `🔕 已开启勿扰模式（长期）。\n推送照常送达，但不响铃。\n\n恢复：<code>/dnd off</code>`
+      `🔕 已开启勿扰模式（长期）。\n推送将<b>暂停</b>，期间命中的帖子会记录下来。\n\n` +
+        `补看：<code>/dnd backlog</code>\n恢复：<code>/dnd off</code>`
     );
   }
 
@@ -739,8 +779,8 @@ async function cmdDnd(ctx, rest) {
     const st = renderDndState(fresh);
     return reply(
       chatId,
-      `🔕 已设置每日静音时段\n<b>状态</b>：${st.text}\n\n` +
-        `<i>推送照常送达，只是这段时间不响铃。立即恢复用 /dnd off。</i>`
+      `🔕 已设置每日暂停时段\n<b>状态</b>：${st.text}\n\n` +
+        `<i>这段时间推送完全不发，命中的帖子会记录，用 /dnd backlog 补看。立即恢复用 /dnd off。</i>`
     );
   }
 
@@ -753,8 +793,8 @@ async function cmdDnd(ctx, rest) {
     const st = renderDndState(fresh);
     return reply(
       chatId,
-      `🔕 已开启定时静音\n<b>状态</b>：${st.text}\n\n` +
-        `<i>推送照常送达，只是到点前不响铃。提前恢复用 /dnd off。</i>`
+      `🔕 已开启定时暂停\n<b>状态</b>：${st.text}\n\n` +
+        `<i>到点前推送完全不发，命中的帖子会记录，用 /dnd backlog 补看。提前恢复用 /dnd off。</i>`
     );
   }
 
@@ -781,7 +821,7 @@ async function cmdStatus(ctx) {
       `<b>关键词</b>：${kwCount}/${formatQuota(q.maxKeywords)} 条\n` +
       `<b>AI 摘要</b>：${ai ? (ai.enabled ? `已启用 · <code>${escapeHtml(ai.model)}</code>` : "已关闭") : "未配置"}\n` +
       `<b>今日用量</b>：推送 ${usage.pushes}/${formatQuota(q.dailyPush)} · AI ${usage.ai_calls}/${formatQuota(q.dailyAi)}\n` +
-      `<b>勿扰模式</b>：${isDndActive(user) ? "🔕 静音中（推送照常送达，不响铃）" : "🔔 未开启"}\n` +
+      `<b>勿扰模式</b>：${isDndActive(user) ? "🔕 暂停推送中（用 /dnd backlog 补看）" : "🔔 未开启"}\n` +
       `<b>注册时间</b>：${user.created_at.slice(0, 19).replace("T", " ")} UTC`
   );
 }

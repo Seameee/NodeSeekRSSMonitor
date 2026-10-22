@@ -67,6 +67,9 @@ const stats = {
   lastUserCount: 0,
   lastPushed: 0,
   lastAiCalls: 0,
+  // 本轮因勿扰被拦下的条数。必须和 lastAiCalls 一样**每轮清零**，
+  // 否则它会变成累计值（这个坑之前已经在 lastAiCalls 上踩过一次）。
+  lastMuted: 0,
   rounds: 0,
   failures: 0,
 };
@@ -85,6 +88,7 @@ export async function runRound() {
   // 之前只做 += 从不清零，于是它其实是个累计值 —— 日志里的「摘要 N 条」
   // 和返回值 aiCalls 会一轮比一轮大，即使当轮一条摘要都没生成。
   stats.lastAiCalls = 0;
+  stats.lastMuted = 0;
 
   // ── 1. 只抓一次 ────────────────────────────────────────────────────────
   let fetched;
@@ -149,10 +153,13 @@ export async function runRound() {
     const remaining = quota.dailyPush - usage.pushes;
     if (remaining <= 0) {
       if (shouldNotifyQuota(uid, "push")) {
+        // 勿扰期间的系统提示同样静音：否则「配额已用尽」会成为勿扰时段里
+        // 唯一还在响的消息，用户会觉得勿扰根本没生效。
         await sendMessage(
           uid,
           `⚠️ 你今日的推送配额已用尽（${usage.pushes}/${quota.dailyPush}），明天恢复。\n` +
-            `如需调整请联系管理员。`
+            `如需调整请联系管理员。`,
+          { disableNotification: isDndActive(user) }
         );
       }
       return { uid, skipped: "push-quota" };
@@ -199,22 +206,40 @@ export async function runRound() {
     const budget = Math.max(0, quota.dailyPush - usage.pushes);
     const usable = hits.slice(0, budget);
 
-    const plan = { uid, summaries: new Map(), targets: 0 };
-    plans.push(plan);
-
-    // 勿扰模式：本轮该用户的推送全部带 disable_notification。
-    // 每个用户各自判断，因此「按个人开关静音」不需要任何全局状态。
-    // 注意**只影响推送**：用户自己发命令收到的回复照常有提示音 —— 那是他刚
-    // 主动操作的动作回执，静音它只会让人以为命令没生效。
-    const silent = isDndActive(user);
+    // 勿扰模式 = **暂停推送**，不是静音推送。
+    //
+    // 为什么不是 disable_notification：Bot API 的静音只做到「通知无声」，
+    // 消息照旧弹进通知栏。用户实测确认了这一点 —— 他要的是完全不打扰。
+    // 而「只显示灰色圆点、不进未读」是 Telegram 账号级的 chat 静音/归档设置，
+    // Bot API 没有任何权限去改接收方的聊天状态，任何 bot 都做不到。
+    // 所以这里选择完全不发，命中落库（status='muted'）供 /dnd backlog 补看。
+    //
+    // 同时跳过 AI 摘要：既然消息不发，摘要就没人看，却要真实扣用户的上游费用。
+    if (isDndActive(user)) {
+      for (const { post, matched } of usable) {
+        for (const kw of matched.length ? matched : ["(none)"]) {
+          logNotification(uid, post, kw, "muted");
+        }
+      }
+      stats.lastMuted += usable.length;
+      // 必须是 continue，不能 return —— 这里是「逐用户」的循环，
+      // 一旦 return 就会把整轮结束掉，后面的用户全部得不到处理。
+      // （写这条注释是因为这个错误真的发生过，且表现为「其他人的推送也没了」。）
+      continue;
+    }
 
     // AI 摘要：只对配置了 AI 且还有配额的用户做
+    const plan = { uid, summaries: new Map(), targets: 0 };
+    plans.push(plan);
     const ai = aiByUser.get(uid);
     if (ai && usable.length) {
       const aiBudget = Math.max(0, quota.dailyAi - usage.ai_calls);
       if (aiBudget <= 0) {
         if (shouldNotifyQuota(uid, "ai")) {
-          await sendMessage(uid, `⚠️ 你今日的 AI 摘要配额已用尽（${usage.ai_calls}/${quota.dailyAi}），明日恢复。`);
+          await sendMessage(
+            uid,
+            `⚠️ 你今日的 AI 摘要配额已用尽（${usage.ai_calls}/${quota.dailyAi}），明日恢复。`
+          );
         }
       } else {
         const targets = usable
@@ -229,12 +254,12 @@ export async function runRound() {
     }
 
     for (const { post, matched } of usable) {
-      pushJobs.push({ uid, post, matched, summary: null, silent });
+      pushJobs.push({ uid, post, matched, summary: null });
       pushOwners.push({ plan, post_id: post.post_id });
     }
 
     if (job.overflow > 0) {
-      pushJobs.push({ uid, overflow: true, items: usable.map((h) => h.post), total: job.overflow, silent });
+      pushJobs.push({ uid, overflow: true, items: usable.map((h) => h.post), total: job.overflow });
       pushOwners.push(null);
     }
   }
@@ -276,29 +301,22 @@ export async function runRound() {
   }
 
   // ── 5. 并发发送 ────────────────────────────────────────────────────────
-  // 不同 chat 并行，同一 chat 由 telegram.js 的锁串行
+  // 不同 chat 并行，同一 chat 由 telegram.js 的锁串行。
+  // 走到这里的都已经不是勿扰用户（勿扰的在上面就 return 了），所以无需静音参数。
   const sendResults = await sendMany(
     pushJobs.map((j) => ({
       run: async () => {
         if (j.overflow) {
-          return {
-            ok: true,
-            r: await sendMessage(j.uid, buildOverflowMsg(j.items, j.total), {
-              disableNotification: j.silent === true,
-            }),
-          };
+          return { ok: true, r: await sendMessage(j.uid, buildOverflowMsg(j.items, j.total)) };
         }
         const rich = buildRichNotifMsg(j.post, j.matched, j.summary);
-        const okRich = await sendRichMessage(j.uid, rich, { silent: j.silent === true });
+        const okRich = await sendRichMessage(j.uid, rich);
         if (okRich) return { ok: true, rich: true };
         // 富文本最终失败（网络重试完仍不通，或正文被 Telegram 拒收）→ 降级经典 HTML。
         // 一定要留痕：降级是用户看得见的版式变化，此前只有 tg 层的报错、
         // 定位问题要靠猜（曾误以为是格式写错）。
-        // 降级路径同样要带静音：否则勿扰期间恰好发生降级时，这一条会突然响。
         log.warn("push", `用户 ${j.uid} 富文本发送失败，本条降级为经典格式`);
-        const r = await sendMessage(j.uid, buildNotifMsg(j.post, j.matched, j.summary), {
-          disableNotification: j.silent === true,
-        });
+        const r = await sendMessage(j.uid, buildNotifMsg(j.post, j.matched, j.summary));
         return { ok: r.ok === true, rich: false, r };
       },
     }))
@@ -330,7 +348,8 @@ export async function runRound() {
   stats.lastDurationMs = Date.now() - started;
   log.info(
     "poller",
-    `本轮完成：${posts.length} 帖 / ${users.length} 用户 / 推送 ${pushed} 条 / 摘要 ${stats.lastAiCalls} 条 / 耗时 ${stats.lastDurationMs}ms`
+    `本轮完成：${posts.length} 帖 / ${users.length} 用户 / 推送 ${pushed} 条 / ` +
+      `勿扰拦下 ${stats.lastMuted} 条 / 摘要 ${stats.lastAiCalls} 条 / 耗时 ${stats.lastDurationMs}ms`
   );
 
   return {
@@ -338,6 +357,7 @@ export async function runRound() {
     posts: posts.length,
     users: users.length,
     pushed,
+    muted: stats.lastMuted,
     aiCalls: stats.lastAiCalls,
     durationMs: stats.lastDurationMs,
   };

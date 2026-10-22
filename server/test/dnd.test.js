@@ -1,12 +1,15 @@
 // ============================================================================
-// 勿扰模式：按用户独立静音推送
+// 勿扰模式：按用户暂停推送 + 补看
 //
 // 核心约定（这些是需求本身，不是实现细节）：
-//   1. 静音 = 消息照常送达 + disable_notification，**不是**停止推送；
-//   2. 每个用户各自判定，A 静音不影响 B；
-//   3. 只静音推送，命令回复照常响 —— 否则用户会以为命令没生效；
-//   4. 静音状态必须落到富文本、降级经典、溢出汇总三条发送路径上，
-//      否则「恰好降级的那一条」会在勿扰期间突然响起来。
+//   1. 勿扰 = **完全不发消息**，而不是「静音发送」。
+//      原因：Bot API 的 disable_notification 只做到「通知无声」，
+//      消息照样弹进通知栏。用户实测确认后要求改成完全不发。
+//      而「只显示灰色圆点、不进未读」是 Telegram 账号级的 chat 静音设置，
+//      Bot API 无权限修改接收方聊天状态，任何 bot 都做不到。
+//   2. 每个用户各自判定，A 暂停不影响 B；
+//   3. 期间命中的帖子必须落库，否则就真丢了（/dnd backlog 要靠它）；
+//   4. 命令回复不受影响 —— 动作用户自己发的，要能看到回执。
 // ============================================================================
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -122,7 +125,7 @@ test("window 的 nextChangeMs 指向下一次翻转点", () => {
   assert.equal(dnd.nextChangeMs(night, at12), Date.parse("2026-10-23T23:00:00+08:00"));
 });
 
-// ─── 端到端：推送是否真的被静音 ──────────────────────────────────────────────
+// ─── 端到端：勿扰期间是否真的「不发送」 ─────────────────────────────────────
 
 const A = 9200;
 const B = 9201;
@@ -143,24 +146,22 @@ const posts = (n, idBase = 970000) =>
     content: "正文内容",
   }));
 
-/**
- * 跑一轮并把「发给该用户的消息」连同静音标记一起取出来。
- * helpers 的 mock 目前只记录 html，这里补一层包装来观测 disable_notification。
- */
-async function roundWithSilentObserver() {
+/** 跑一轮，收集实际发出的 Telegram 请求 */
+async function roundCapture(rssXml) {
   const captured = [];
-  const inner = installFetchMock({ rssXml: makeRss(posts(2)) });
+  const inner = installFetchMock({ rssXml });
   const wrapped = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
     if (u.includes("api.telegram.org")) {
-      const method = u.split("/").pop();
+      const m = u.split("/").pop();
       const body = init.body ? JSON.parse(init.body) : {};
-      if (method === "sendMessage" || method === "sendRichMessage") {
+      if (m === "sendMessage" || m === "sendRichMessage") {
         captured.push({
           chatId: body.chat_id,
-          method,
+          method: m,
           silent: body.disable_notification === true,
+          text: body.text || body.rich_message?.html || "",
         });
       }
     }
@@ -174,82 +175,80 @@ async function roundWithSilentObserver() {
   return { captured, sent: inner.sent };
 }
 
-test("推送：该用户开启勿扰 → 消息带 disable_notification 且内容照常送达", async () => {
+test("勿扰：该用户**完全不发消息**（不是静音发送）", async () => {
   seedUser(A);
   db.setDndAlways(A);
 
-  const { captured, sent } = await roundWithSilentObserver();
+  const { captured } = await roundCapture(makeRss(posts(2)));
   const mine = captured.filter((c) => c.chatId === A);
-  assert.ok(mine.length >= 1, "应当仍然发送了消息（静音 ≠ 不推送）");
-  assert.ok(mine.every((c) => c.silent === true), "每条都应带 disable_notification");
-
-  // 内容必须真的送到了 —— 这是「静音而非暂停」的关键证据
-  const delivered = sent.filter((m) => m.chatId === A);
-  assert.equal(delivered.length, 2, "2 条命中应照常送达 2 条消息");
-  assert.ok(delivered.some((m) => m.html.includes("第 1 号")));
+  assert.equal(mine.length, 0, `勿扰期间不应发出任何消息（实际 ${mine.length} 条）`);
 });
 
-test("推送：未开启勿扰的用户不受影响，且与静音用户互不干扰", async () => {
+test("勿扰：命中仍要落库，否则真的丢了", async () => {
+  seedUser(A);
+  db.setDndAlways(A);
+  const before = db.countMutedHits(A, new Date(Date.now() - 600_000).toISOString());
+
+  const { captured } = await roundCapture(makeRss(posts(3)));
+  assert.equal(captured.filter((c) => c.chatId === A).length, 0, "不发消息");
+
+  const since = new Date(Date.now() - 600_000).toISOString();
+  const after = db.countMutedHits(A, since);
+  assert.equal(after - before, 3, `应记录 3 条被拦下的命中（实际 ${after - before}）`);
+
+  const hits = db.getMutedHits(A, since, 10);
+  assert.equal(hits.length, 3);
+  assert.ok(hits.every((h) => h.title.includes("绿云")), "记录里应包含标题供补看");
+});
+
+test("勿扰：只拦该用户，其他用户照常收到", async () => {
   seedUser(A);
   seedUser(B);
-  db.setDndAlways(A); // 只静音 A
+  db.setDndAlways(A); // 只暂停 A
 
-  const { captured } = await roundWithSilentObserver();
+  const { captured } = await roundCapture(makeRss(posts(2)));
   const toA = captured.filter((c) => c.chatId === A);
   const toB = captured.filter((c) => c.chatId === B);
 
-  assert.ok(toA.length > 0 && toB.length > 0);
-  assert.ok(toA.every((c) => c.silent === true), "A 全静音");
-  assert.ok(toB.every((c) => c.silent === false), "B 不应被静音（按用户独立）");
+  assert.equal(toA.length, 0, "A 不应收到任何消息");
+  assert.equal(toB.length, 2, `B 应照常收到 2 条（实际 ${toB.length}）`);
+  assert.ok(toB.every((c) => c.silent === false), "B 的消息不应被静音");
 });
 
-test("推送：勿扰关闭后恢复响铃", async () => {
+test("勿扰关闭后恢复推送，且不会重复推已拦下的旧命中", async () => {
   seedUser(A);
   db.setDndAlways(A);
-  await roundWithSilentObserver();
+  await roundCapture(makeRss(posts(2)));
+  assert.equal(db.countMutedHits(A, new Date(Date.now() - 600_000).toISOString()), 2);
 
+  // 关闭勿扰后，同一批帖子已在勿扰期间被标记已见，不应再推
   db.clearDnd(A);
-  // 换一批新帖，确保真的有新推送
-  const inner = installFetchMock({ rssXml: makeRss(posts(2, 980000)) });
-  globalThis.fetch = (() => {
-    const base = globalThis.fetch;
-    return async (url, init = {}) => {
-      const body = init.body ? JSON.parse(init.body) : {};
-      if (String(url).includes("sendRichMessage")) {
-        inner.__last = body;
-      }
-      return base(url, init);
-    };
-  })();
-  await poller.runRound();
-  assert.equal(inner.__last?.disable_notification, undefined, "恢复正常后不应带静音参数");
+  const { captured } = await roundCapture(makeRss(posts(2)));
+  assert.equal(
+    captured.filter((c) => c.chatId === A).length,
+    0,
+    "同一批帖子不该因关闭勿扰而重新推送"
+  );
+
+  // 新帖则应正常推送
+  const { captured: fresh } = await roundCapture(makeRss(posts(2, 980000)));
+  assert.equal(fresh.filter((c) => c.chatId === A).length, 2, "恢复后新帖应正常推送");
 });
 
-test("推送：富文本失败降级时，静音标记必须跟着走到经典格式", async () => {
-  // 这是真实的风险点：勿扰期间恰好降级的那一条会突然响，用户会觉得勿扰没生效
+test("勿扰期间不消耗 AI 摘要（消息都不发，摘要没人看还要花钱）", async () => {
   seedUser(A);
   db.setDndAlways(A);
-
-  const captured = [];
-  const inner = installFetchMock({ rssXml: makeRss(posts(2)), failRich: true });
-  const wrapped = globalThis.fetch;
-  globalThis.fetch = async (url, init = {}) => {
-    const u = String(url);
-    const body = init.body ? JSON.parse(init.body) : {};
-    if (u.includes("sendMessage")) {
-      captured.push({ chatId: body.chat_id, silent: body.disable_notification === true });
-    }
-    return wrapped(url, init);
+  const cfg = {
+    baseUrl: "https://api.deepseek.com/v1",
+    apiKeyEnc: "x",
+    apiKeyHint: "hint",
+    model: "deepseek-chat",
   };
-  try {
-    await poller.runRound();
-  } finally {
-    globalThis.fetch = wrapped;
-  }
+  db.upsertAiConfig(A, cfg);
 
-  const mine = captured.filter((c) => c.chatId === A);
-  assert.ok(mine.length >= 1, "降级后应当有 sendMessage 发出");
-  assert.ok(mine.every((c) => c.silent === true), "降级路径也必须带静音");
+  const { captured } = await roundCapture(makeRss(posts(2)));
+  assert.equal(captured.filter((c) => c.chatId === A).length, 0, "不发消息");
+  assert.equal(db.getUsage(A).ai_calls, 0, "勿扰期间不该产生 AI 调用");
 });
 
 // ─── 命令层 ──────────────────────────────────────────────────────────────────
@@ -263,7 +262,7 @@ const say = async (text, id = A) => {
 
 test("/dnd 2h：写入 until 且回复里说明会自动恢复", async () => {
   const html = await say("/dnd 2h");
-  assert.match(html, /定时静音/);
+  assert.match(html, /定时暂停/);
   const u = db.getUser(A);
   assert.equal(u.dnd_mode, "until");
   assert.ok(Date.parse(u.dnd_until) > Date.now(), "到期时间应在将来");
@@ -272,7 +271,7 @@ test("/dnd 2h：写入 until 且回复里说明会自动恢复", async () => {
 
 test("/dnd 23:00-08:00：写入 window 并保存时段", async () => {
   const html = await say("/dnd 23:00-08:00");
-  assert.match(html, /每日静音时段/);
+  assert.match(html, /每日暂停时段/);
   const u = db.getUser(A);
   assert.equal(u.dnd_mode, "window");
   assert.equal(u.dnd_start, "23:00");
@@ -316,7 +315,7 @@ test("/dnd tz：合法时区被保存，非法时区被拒收", async () => {
 
 test("/dnd：无参数时展示状态；无法识别的参数给出用法", async () => {
   let html = await say("/dnd");
-  assert.match(html, /未静音/);
+  assert.match(html, /未开启/);
 
   html = await say("/dnd 完全不是时长");
   assert.match(html, /无法识别/);
@@ -330,7 +329,7 @@ test("/status 会显示勿扰状态", async () => {
   await router.handleUpdate(makeUpdate("/status", { id: A }));
   const html = sent.at(-1)?.html ?? "";
   assert.match(html, /勿扰模式/);
-  assert.match(html, /静音中/);
+  assert.match(html, /暂停推送中/);
 });
 
 test("命令回复不被静音：勿扰期间发 /dnd 仍正常响铃", async () => {
@@ -357,4 +356,86 @@ test("命令回复不被静音：勿扰期间发 /dnd 仍正常响铃", async ()
   const mine = captured.filter((c) => c.chatId === A);
   assert.ok(mine.length >= 1);
   assert.ok(mine.every((c) => c.silent === false), "命令回复不应被静音");
+});
+
+// ─── /dnd backlog 补看 ───────────────────────────────────────────────────────
+
+test("/dnd backlog：列出勿扰期间拦下的帖子，含标题与链接", async () => {
+  seedUser(A);
+  db.setDndAlways(A);
+  await roundCapture(makeRss(posts(3)));
+
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd backlog", { id: A }));
+  const html = sent.at(-1)?.html ?? "";
+
+  assert.match(html, /错过 3 条/, `应显示错过 3 条，实际：${html.slice(0, 120)}`);
+  assert.match(html, /绿云 第 1 号/);
+  assert.match(html, /绿云 第 3 号/);
+  assert.match(html, /https:\/\/www\.nodeseek\.com\/post-/, "应带原帖链接");
+});
+
+test("/dnd backlog：没有错过时明确说明，而不是空消息", async () => {
+  seedUser(A);
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd backlog", { id: A }));
+  const html = sent.at(-1)?.html ?? "";
+  assert.match(html, /没有错过/);
+});
+
+test("/dnd backlog --clear：清空补看记录后不再列出", async () => {
+  seedUser(A);
+  db.setDndAlways(A);
+  await roundCapture(makeRss(posts(2)));
+  assert.equal(db.countMutedHits(A, new Date(Date.now() - 600_000).toISOString()), 2);
+
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd backlog --clear", { id: A }));
+  assert.match(sent.at(-1)?.html ?? "", /已清空/);
+
+  // 清空的是锚点，历史记录还在；下次补看应从新锚点起算，不该再列出旧的
+  const { sent: s2 } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd backlog", { id: A }));
+  const html = s2.at(-1)?.html ?? "";
+  assert.match(html, /没有错过/, `清空后应看不到旧记录，实际：${html.slice(0, 120)}`);
+});
+
+test("/dnd 状态里提示错过了多少条", async () => {
+  seedUser(A);
+  db.setDndAlways(A);
+  await roundCapture(makeRss(posts(2)));
+
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd", { id: A }));
+  const html = sent.at(-1)?.html ?? "";
+  assert.match(html, /暂停推送中/);
+  assert.match(html, /错过<\/b>：2 条|错过\S*2 条/, `应提示错过 2 条，实际：${html.slice(0, 200)}`);
+});
+
+test("/dnd off 时提示还有多少条可补看", async () => {
+  seedUser(A);
+  db.setDndAlways(A);
+  await roundCapture(makeRss(posts(2)));
+
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd off", { id: A }));
+  const html = sent.at(-1)?.html ?? "";
+  assert.match(html, /恢复/);
+  assert.match(html, /2 条/, "应提示错过 2 条可补看");
+});
+
+test("/history 不显示勿扰拦下的帖子（它们从未发出，不能算推送过）", async () => {
+  seedUser(A);
+  db.setDndAlways(A);
+  await roundCapture(makeRss(posts(3)));
+
+  const { sent } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/history", { id: A }));
+  const html = sent.at(-1)?.html ?? "";
+  assert.match(html, /暂无推送记录/, `勿扰期间没推送过，/history 应为空，实际：${html.slice(0, 150)}`);
+
+  // 但补看能拿到
+  const { sent: s2 } = installFetchMock();
+  await router.handleUpdate(makeUpdate("/dnd backlog", { id: A }));
+  assert.match(s2.at(-1)?.html ?? "", /错过 3 条/);
 });

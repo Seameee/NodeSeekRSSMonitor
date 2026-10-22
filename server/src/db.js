@@ -168,6 +168,9 @@ function migrateSchema() {
     addColumnIfMissing("users", "dnd_start", "TEXT"),
     addColumnIfMissing("users", "dnd_end", "TEXT"),
     addColumnIfMissing("users", "dnd_tz", "TEXT"),
+    // 勿扰起点：补看（/dnd backlog）从这里开始算。
+    // 关闭勿扰后**不清空** —— 用户往往是醒来之后才去补看，清早了就什么都看不到。
+    addColumnIfMissing("users", "dnd_since", "TEXT"),
   ].filter(Boolean);
   if (added.length) log.info("db", `已为老库补齐勿扰模式字段：${added.length} 列`);
 }
@@ -271,7 +274,7 @@ export function setUserStatus(telegramId, status) {
 // dnd_until、window 的 dnd_start/end 不该互相残留），整行写能把状态收敛成
 // 唯一一种解释，不会出现「改了模式但旧字段还在、判定逻辑按旧字段走」的歧义。
 
-/** 关闭勿扰 */
+/** 关闭勿扰（保留 dnd_since，供事后补看） */
 export function clearDnd(telegramId) {
   return prep(
     `UPDATE users SET dnd_mode='off', dnd_until=NULL, dnd_start=NULL, dnd_end=NULL
@@ -279,28 +282,48 @@ export function clearDnd(telegramId) {
   ).run(telegramId).changes;
 }
 
-/** 一直静音，直到显式关闭 */
-export function setDndAlways(telegramId) {
+/** 一直暂停推送，直到显式关闭 */
+export function setDndAlways(telegramId, sinceIso = null) {
   return prep(
-    `UPDATE users SET dnd_mode='on', dnd_until=NULL, dnd_start=NULL, dnd_end=NULL
+    `UPDATE users SET dnd_mode='on', dnd_until=NULL, dnd_start=NULL, dnd_end=NULL,
+       dnd_since=COALESCE(?, dnd_since, ?)
      WHERE telegram_id=?`
-  ).run(telegramId).changes;
+  ).run(sinceIso, now(), telegramId).changes;
 }
 
-/** 静音到某个时间点（ISO 字符串） */
-export function setDndUntil(telegramId, untilIso) {
+/** 暂停推送到某个时间点（ISO 字符串） */
+export function setDndUntil(telegramId, untilIso, sinceIso = null) {
   return prep(
-    `UPDATE users SET dnd_mode='until', dnd_until=?, dnd_start=NULL, dnd_end=NULL
+    `UPDATE users SET dnd_mode='until', dnd_until=?, dnd_start=NULL, dnd_end=NULL,
+       dnd_since=COALESCE(?, dnd_since, ?)
      WHERE telegram_id=?`
-  ).run(untilIso, telegramId).changes;
+  ).run(untilIso, sinceIso, now(), telegramId).changes;
 }
 
-/** 每天固定时段静音（HH:MM 形式，本地时钟） */
-export function setDndWindow(telegramId, start, end) {
+/** 每天固定时段暂停推送（HH:MM 形式，本地时钟） */
+export function setDndWindow(telegramId, start, end, sinceIso = null) {
   return prep(
-    `UPDATE users SET dnd_mode='window', dnd_until=NULL, dnd_start=?, dnd_end=?
+    `UPDATE users SET dnd_mode='window', dnd_until=NULL, dnd_start=?, dnd_end=?,
+       dnd_since=COALESCE(?, dnd_since, ?)
      WHERE telegram_id=?`
-  ).run(start, end, telegramId).changes;
+  ).run(start, end, sinceIso, now(), telegramId).changes;
+}
+
+/** 补看范围起点：没记录过就用 24 小时前兜底，避免一次扫出几年历史 */
+export function dndSinceOf(user) {
+  const s = user?.dnd_since;
+  return s && Number.isFinite(Date.parse(s)) ? s : new Date(Date.now() - 86400_000).toISOString();
+}
+
+/**
+ * 「已看完」：把锚点推到此刻。
+ *
+ * 不能简单地把 dnd_since 置 NULL —— dndSinceOf 在无锚点时会兜底成「24 小时前」，
+ * 于是下一次 /dnd backlog 又把刚看过的全列出来，用户会以为清空没生效。
+ * 推到此刻才是「从现在起重新累计」的正确语义。
+ */
+export function markBacklogSeen(telegramId) {
+  return prep("UPDATE users SET dnd_since=? WHERE telegram_id=?").run(now(), telegramId).changes;
 }
 
 /** 设置用户时区（影响 window 模式的判定与文案显示） */
@@ -626,12 +649,47 @@ export function logNotification(telegramId, post, keyword, status) {
   ).run(telegramId, post.post_id, keyword, post.title, post.link, post.category, post.author, status, now());
 }
 
+/**
+ * 推送历史（/history）。
+ *
+ * **必须排除 status='muted'**：那些是勿扰期间被拦下、从未发出的帖子。
+ * 它们和真正的推送共用 notifications 表（见 getMutedHits 的说明），
+ * 若不排除，/history 会显示一堆「明明没收到却被说成推送过」的记录 ——
+ * 用户会以为勿扰失效了。补看走 /dnd backlog，两条路径语义要分开。
+ */
 export function getHistory(telegramId, limit = 10) {
   return prep(
     `SELECT post_id, GROUP_CONCAT(DISTINCT keyword) AS keywords,
             title, link, category, author, MIN(status) AS status, MAX(sent_at) AS sent_at
-     FROM notifications WHERE telegram_id=? GROUP BY post_id ORDER BY sent_at DESC LIMIT ?`
+     FROM notifications WHERE telegram_id=? AND status <> 'muted'
+     GROUP BY post_id ORDER BY sent_at DESC LIMIT ?`
   ).all(telegramId, limit);
+}
+
+/**
+ * 勿扰期间被拦下的命中。
+ *
+ * 为什么要落库：勿扰改成「暂停推送」后，消息不再发出去 —— 如果什么都不记，
+ * 这段时间的命中就彻底消失了，用户醒来只能自己去论坛翻。落在 notifications
+ * 里（status='muted'）复用了推送历史这套结构，于是 /history 和 /dnd backlog
+ * 都能直接读到，不必再维护第二张表。
+ *
+ * 状态值与「已发送」区分开，是为了让补看的条数能算准：`sent` 才是真正推送过的。
+ */
+export function getMutedHits(telegramId, sinceIso, limit = 20) {
+  return prep(
+    `SELECT post_id, GROUP_CONCAT(DISTINCT keyword) AS keywords,
+            title, link, category, author, MAX(sent_at) AS sent_at
+     FROM notifications
+     WHERE telegram_id=? AND status='muted' AND sent_at >= ?
+     GROUP BY post_id ORDER BY sent_at DESC LIMIT ?`
+  ).all(telegramId, sinceIso, limit);
+}
+
+export function countMutedHits(telegramId, sinceIso) {
+  return prep(
+    "SELECT COUNT(DISTINCT post_id) AS n FROM notifications WHERE telegram_id=? AND status='muted' AND sent_at >= ?"
+  ).get(telegramId, sinceIso).n;
 }
 
 // ─── 用量与配额 ──────────────────────────────────────────────────────────────
