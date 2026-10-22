@@ -315,3 +315,56 @@ test("Worker 无法识别的参数给出用法而不是静默失败", async () =
   assert.match(html, /无法识别/);
   assert.match(html, /\/dnd 2h/);
 });
+
+// ─── 备用源 link 改写（曾因 const 导致整个 Worker 无法构建）──────────────
+
+test("Worker 备用源：能从 Telegram 转发里提取 NodeSeek 原始链接", async () => {
+  resetDb();
+  await cmd("/add 绿云");
+  // 主源失败 → 回落到备用源；备用源的 link 是 t.me 链接，
+  // 真正的帖子地址在 description 里，必须被改写进 link。
+  const tgXml = `<?xml version="1.0"?><rss version="2.0"><channel><title>N</title>
+    <item>
+      <title><![CDATA[【出】绿云 备用源测试]]></title>
+      <link>https://t.me/nodeseekc/12345</link>
+      <guid>tg-12345</guid>
+      <description><![CDATA[原帖：https://www.nodeseek.com/post-777001-1 内容正文]]></description>
+    </item>
+  </channel></rss>`;
+
+  const realFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    if (u.includes("api.telegram.org")) {
+      const b = init.body ? JSON.parse(init.body) : {};
+      sent.push({ text: b.text || b.rich_message?.html || "" });
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: { message_id: 1 } }), text: async () => "{}" };
+    }
+    if (u.includes("rss.nodeseek.com")) {
+      // 主源失败，逼它走备用源
+      return { ok: false, status: 500, text: async () => "", json: async () => ({}) };
+    }
+    if (u.includes("seaya") || u.includes("rsshub")) {
+      return {
+        ok: true, status: 200,
+        headers: new Map([["etag", '"tg"']]),
+        text: async () => tgXml,
+        json: async () => ({}),
+      };
+    }
+    return { ok: false, status: 500, text: async () => "", json: async () => ({}) };
+  };
+  try {
+    const worker = (await import("../../worker.js")).default;
+    const pending = [];
+    await worker.scheduled({ cron: "* * * * *" }, env, { waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const all = sent.map((s) => s.text).join("\n");
+  assert.match(all, /post-777001-1/, `推送里应出现 NodeSeek 原始链接，实际：${all.slice(0, 200)}`);
+  assert.doesNotMatch(all, /t\.me\/nodeseekc\/12345/, "不应把 Telegram 转发链接当作帖子地址");
+});

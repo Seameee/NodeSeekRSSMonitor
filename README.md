@@ -2,7 +2,7 @@
 
 [![Node](https://img.shields.io/badge/node-24.22.1-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-185%20passing-brightgreen?style=flat-square)](server/test)
+[![Tests](https://img.shields.io/badge/tests-186%20passing-brightgreen?style=flat-square)](server/test)
 [![Registry](https://img.shields.io/badge/ghcr.io-nodeseek--monitor-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/Seameee/packages/container/nodeseek-monitor)
 [![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
 
@@ -268,6 +268,7 @@ npx wrangler tail
 ```
 
 - 修改 `worker.js` 后需重新执行 `npx wrangler deploy` 才会生效。
+- 部署前可用 `npx wrangler deploy --dry-run` 检查打包是否通过。该命令不会上传，只做构建与绑定检查，能提前发现语法或类型层面的构建错误。
 
 ## 运行模式
 
@@ -780,7 +781,7 @@ docker exec nodeseek-monitor node --version
 ```
 ├── server/                    ← Docker 版全部内容
 │   ├── src/                   ← 20 个模块，零第三方依赖，全部使用 Node 内置能力
-│   ├── test/                  ← 19 个测试文件，185 项
+│   ├── test/                  ← 19 个测试文件，186 项
 │   ├── Dockerfile             ← 多阶段构建，node:24.22.1-alpine，非 root
 │   ├── docker-compose.yml     ← 含安全加固与资源限制
 │   └── .env.example           ← 环境变量模板
@@ -828,7 +829,7 @@ cd server && node --check src/*.js && node --test test/*.test.js
 | 性能 | worker 线程池与 ReDoS 硬超时、水位线去重、AI 跨用户拍平、发送令牌桶 |
 | 安全 | AES-256-GCM 加密 Key、日志脱敏、SSRF 词法校验、容器加固 |
 | 勿扰模式 | 按用户暂停推送、定时与每日时段、跨零点与时区处理、补看 |
-| 工程 | 185 项测试、可复跑基准脚本、多架构 CI 构建 |
+| 工程 | 186 项测试、可复跑基准脚本、多架构 CI 构建 |
 
 ### 授权状态
 
