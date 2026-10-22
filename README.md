@@ -12,7 +12,8 @@
 
 ## 目录
 
-- [部署](#部署)
+- [Docker 部署](#docker-部署)
+- [Cloudflare Workers 部署](#cloudflare-workers-部署)
 - [运行模式](#运行模式)
 - [命令](#命令)
 - [匹配规则](#匹配规则)
@@ -25,7 +26,7 @@
 - [Node 版本与安全更新](#node-版本与安全更新)
 - [仓库结构](#仓库结构)
 
-## 部署
+## Docker 部署
 
 ### 前置条件
 
@@ -154,6 +155,120 @@ build:
   context: https://github.com/Seameee/NodeSeekRSSMonitor.git#docker:server
 ```
 
+## Cloudflare Workers 部署
+
+Workers 版（`worker.js`）是单用户部署，运行在 Cloudflare 边缘，无需自备服务器。与 Docker 版相比有几点不同：
+
+| | Docker 版 | Workers 版 |
+| --- | --- | --- |
+| 用户数 | 多用户，自助 `/bind` | 单用户，只服务 `ALLOWED_USER_ID` |
+| 存储 | 本地 SQLite | Cloudflare D1 |
+| 接收方式 | 长轮询 | Webhook |
+| 调度 | 进程内定时器 | Cron Trigger |
+| 命令 | 完整命令集，含 `/bind`、`/ai`、`/admin` | 无 `/bind`、`/ai`、`/admin` |
+| AI 摘要 | 每个用户在 Telegram 内自带 Key | 通过环境变量统一配置 |
+| 首轮行为 | 推送当前约 20 条帖子 | 静默标记，不推送 |
+
+Workers 版需要 D1 数据库绑定、一个 Cron Trigger 和若干环境变量。仓库内没有附带 `wrangler.toml`，因为数据库 ID 与绑定需与实际账号对应，无法预先写死。下面给出完整的配置内容。
+
+### 前置条件
+
+- Cloudflare 账号
+- Node.js 22.13 及以上（供 `wrangler` 运行）
+- 一个 Bot Token，从 [@BotFather](https://t.me/BotFather) 用 `/newbot` 获取
+- 自己的 Telegram 用户 ID，从 [@userinfobot](https://t.me/userinfobot) 获取
+
+### 创建 D1 数据库
+
+```bash
+npx wrangler login
+npx wrangler d1 create nodeseek
+```
+
+命令会输出 `database_id`，填入下一步的配置文件。
+
+### 编写 wrangler.toml
+
+在仓库根目录（与 `worker.js` 同级）创建 `wrangler.toml`：
+
+```toml
+name = "nodeseek-monitor"
+main = "worker.js"
+compatibility_date = "2026-10-22"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nodeseek"
+database_id = "这里填 d1 create 输出的 ID"
+
+[triggers]
+crons = ["* * * * *"]
+```
+
+`binding = "DB"` 必须保持这个名称，代码通过 `env.DB` 访问数据库。
+
+### 配置环境变量
+
+必填三项：
+
+```bash
+npx wrangler secret put TELEGRAM_BOT_TOKEN
+npx wrangler secret put WEBHOOK_SECRET
+```
+
+`ALLOWED_USER_ID` 不是密钥，可写在 `wrangler.toml` 的 `[vars]` 段：
+
+```toml
+[vars]
+ALLOWED_USER_ID = "你的 Telegram 用户 ID"
+```
+
+`WEBHOOK_SECRET` 用随机字符串即可，`openssl rand -hex 32` 生成一个。它用于校验 Webhook 请求来源，未设置时代码会跳过校验。
+
+需要 AI 摘要时再补以下变量，全部通过 `wrangler secret put` 设置或写入 `[vars]`：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `AI_API_KEY` | 无 | 上游模型密钥，未设置则不启用摘要 |
+| `AI_MODEL` | 无 | 主模型名称，与 `AI_API_KEY` 同时存在才启用 |
+| `AI_BASE_URL` | `https://api.deepseek.com/v1` | 上游地址，需兼容 OpenAI 协议 |
+| `AI_MODEL_FALLBACK` | 空 | 备用模型，逗号分隔，按顺序回退 |
+| `AI_MIN_LEN` | `0` | 正文最小长度，短于该值不生成摘要 |
+| `AI_MAX_PER_ROUND` | `5` | 每轮最多生成几条摘要 |
+| `AI_MAX_TOKENS` | `4000` | 单次生成上限。推理型模型不宜设得过小，否则思考过程会耗尽预算并返回空内容 |
+| `AI_TIMEOUT_MS` | `15000` | 单次请求超时 |
+| `AI_PROMPT` | 内置默认 | 自定义摘要提示词 |
+
+### 部署与初始化
+
+```bash
+npx wrangler deploy
+```
+
+部署后会得到一个 `https://<worker名>.<子域>.workers.dev` 域名。首次部署完成后需要执行一次初始化，它会建表并注册 Webhook：
+
+```bash
+curl -s https://<worker名>.<子域>.workers.dev/setup
+```
+
+返回内容应包含 `"database": "ok"` 与 Telegram 的 Webhook 注册结果。若 `webhook` 部分报错，通常是因为 `TELEGRAM_BOT_TOKEN` 未设置或填写错误。
+
+初始化完成后，Cron Trigger 会每分钟触发一次轮询。首次轮询只做静默标记，不会推送历史帖子。
+
+在 Telegram 私聊 Bot 发送 `/status` 确认部署正常。
+
+### 注意事项
+
+- 同一 Bot Token 不能同时用于长轮询和 Webhook。若该 Token 已被 Docker 版使用，需先停掉 Docker 版，否则 Telegram 侧会返回 `409 Conflict`。
+- Workers 版的状态（包括勿扰设置）存储在 D1 的 `settings` 表，与 Docker 版不共享数据。
+- 查看实时日志：
+
+```bash
+npx wrangler tail
+```
+
+- 修改 `worker.js` 后需重新执行 `npx wrangler deploy` 才会生效。
+
 ## 运行模式
 
 由 `MULTI_USER_ENABLED` 决定，默认为单用户模式。
@@ -178,6 +293,8 @@ build:
 优先级为：管理员覆盖（存于数据库，重启后仍有效）优先于 `.env` 中的 `MULTI_USER_ENABLED`。
 
 ## 命令
+
+下表为 Docker 版命令集。Workers 版没有 `/bind`、`/ai`、`/admin`，其余命令（`/add`、`/list`、`/remove`、`/pause`、`/resume`、`/categories`、`/dnd`、`/status`、`/history`、`/help`）行为相同，另外多一个 `/dev` 用于临时跳过关键词过滤、推送全部新帖，详见 [Workers 部署](#cloudflare-workers-部署)。
 
 ### 所有用户
 

@@ -188,7 +188,10 @@ function parseRSS(xml, sourceIndex = 0) {
       return r ? (r[1] || r[2] || "").trim() : "";
     };
 
-    const link = tag("link") || (b.match(/<link[^>]+href="([^"]*)"/) || [])[1] || "";
+    // 必须是 let：备用源分支里会把 link 改写成 NodeSeek 原始链接（见下方 nsLink）。
+    // 原先写成 const，worker 打包时直接报 Cannot assign to "link" because it is a constant，
+    // 导致整个 Worker 无法部署。
+    let link = tag("link") || (b.match(/<link[^>]+href="([^"]*)"/) || [])[1] || "";
     const id = tag("id") || tag("guid");
     // 正文：主源是帖子正文纯文本，备用源是 TG 频道的转发文案
     const description = tag("description");
